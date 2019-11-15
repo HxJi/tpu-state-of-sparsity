@@ -1,4 +1,5 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# coding=utf-8
+# Copyright 2019 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,259 +12,357 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
-"""Train a ResNet-50 model on ImageNet on TPU."""
 
+"""This script trains a ResNet model that implements various pruning methods.
+
+Code partially branched out from
+third_party/cloud_tpu/models/resnet/resnet_main.py.
+"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
-import time
-
 from absl import app
 from absl import flags
 from absl import logging
-import numpy as np
-import tensorflow.compat.v1 as tf
-import tensorflow.compat.v2 as tf2
+import tensorflow as tf
+import time
 
-from common import inference_warmup
-from common import tpu_profiler_hook
-from hyperparameters import common_hparams_flags
-from hyperparameters import common_tpu_flags
-from hyperparameters import flags_to_params
-from hyperparameters import params_dict
+
 from official.resnet import imagenet_input
 from official.resnet import lars_util
 from official.resnet import resnet_model
+from official.resnet import utils
 from official.resnet.configs import resnet_config
-from tensorflow.core.protobuf import rewriter_config_pb2  # pylint: disable=g-direct-tensorflow-import
 
-common_tpu_flags.define_common_tpu_flags()
-common_hparams_flags.define_common_hparams_flags()
+from tensorflow.contrib.model_pruning.python import pruning
+from tensorflow.contrib.tpu.python.tpu import tpu_config
+from tensorflow.contrib.tpu.python.tpu import tpu_estimator
+from tensorflow.contrib.training.python.training import evaluation
 
-FLAGS = flags.FLAGS
-
-FAKE_DATA_DIR = 'gs://cloud-tpu-test-datasets/fake_imagenet'
+# Emurate Flags 
+flags.DEFINE_string(
+    'precision',
+    default='float32',
+    help=('Precision to use; one of: {bfloat16, float32}'))
 
 flags.DEFINE_integer(
-    'resnet_depth', default=None,
+    'num_workers', 
+    default=1, 
+    help=('Number of training workers.'))
+
+flags.DEFINE_float(
+    'base_learning_rate',
+    default=0.1,
+    help=('Base learning rate when train batch size is 256.'))
+
+flags.DEFINE_float(
+    'momentum',
+    default=0.9,
+    help=('Momentum parameter used in the MomentumOptimizer.'))
+
+flags.DEFINE_integer('ps_task', 0, 'Task id of the replica running the training.')
+
+flags.DEFINE_float(
+    'weight_decay',
+    default=1e-4,
+    help=('Weight decay coefficiant for l2 regularization.'))
+flags.DEFINE_string('master', '', 'Master job.')
+flags.DEFINE_string('tpu_job_name', None, 'For complicated TensorFlowFlock')
+
+flags.DEFINE_integer(
+    'steps_per_checkpoint',
+    default=1251,
+    help=('Controls how often checkpoints are generated. More steps per '
+          'checkpoint = higher utilization of TPU and generally higher '
+          'steps/sec'))
+
+flags.DEFINE_integer(
+    'keep_checkpoint_max', default=90, help=('Number of checkpoints to hold.'))
+
+flags.DEFINE_string(
+    'data_directory',
+    None,
+    'The location of the sstable used for training.')
+flags.DEFINE_string(
+    'data_format',
+    default='channels_last',
+    help=('A flag to override the data format used in the model. The value'
+          ' is either channels_first or channels_last. To run the network on'
+          ' CPU or TPU, channels_last should be used. For GPU, channels_first'
+          ' will improve performance.'))
+flags.DEFINE_bool(
+    'transpose_input',
+    default=False,
+    help='Use TPU double transpose optimization')
+flags.DEFINE_integer(
+    'resnet_depth',
+    default=50,
     help=('Depth of ResNet model to use. Must be one of {18, 34, 50, 101, 152,'
           ' 200}. ResNet-18 and 34 use the pre-activation residual blocks'
           ' without bottleneck layers. The other models use pre-activation'
           ' bottleneck layers. Deeper models require more training time and'
           ' more memory and may require reducing --train_batch_size to prevent'
           ' running out of memory.'))
-
+flags.DEFINE_float('label_smoothing', 0.1,
+                   'Relax confidence in the labels by (1-label_smoothing).')
 flags.DEFINE_integer(
-    'num_train_images', default=None, help='Size of training data set.')
-
+    'train_steps',
+    default=112590,
+    help=('The number of steps to use for training. Default is 112590 steps'
+          ' which is approximately 90 epochs at batch size 1024. This flag'
+          ' should be adjusted according to the --train_batch_size flag.'))
 flags.DEFINE_integer(
-    'num_eval_images', default=None, help='Size of evaluation data set.')
-
+    'train_batch_size', default=1024, help='Batch size for training.')
 flags.DEFINE_integer(
-    'num_label_classes', default=None, help='Number of classes, at least 2')
-
-flags.DEFINE_string(
-    'data_format', default=None,
-    help=('A flag to override the data format used in the model. The value'
-          ' is either channels_first or channels_last. To run the network on'
-          ' CPU or TPU, channels_last should be used. For GPU, channels_first'
-          ' will improve performance.'))
-
-flags.DEFINE_bool(
-    'transpose_input', default=None,
-    help='Use TPU double transpose optimization')
-
-flags.DEFINE_bool(
-    'use_cache', default=None, help=('Enable cache for training input.'))
-
-flags.DEFINE_integer('image_size', None, 'The input image size.')
-
-flags.DEFINE_string(
-    'dropblock_groups', None,
-    help=('A string containing comma separated integers indicating ResNet '
-          'block groups to apply DropBlock. `3,4` means to apply DropBlock to '
-          'block groups 3 and 4. Use an empty string to not apply DropBlock to '
-          'any block group.'))
-flags.DEFINE_float(
-    'dropblock_keep_prob', default=None,
-    help=('keep_prob parameter of DropBlock. Will not be used if '
-          'dropblock_groups is empty.'))
+    'eval_batch_size', default=1000, help='Batch size for evaluation.')
 flags.DEFINE_integer(
-    'dropblock_size', default=None,
-    help=('size parameter of DropBlock. Will not be used if dropblock_groups '
-          'is empty.'))
-
+    'num_train_images', default=1281167, help='Size of training data set.')
 flags.DEFINE_integer(
-    'profile_every_n_steps', default=0,
-    help=('Number of steps between collecting profiles if larger than 0'))
-
-flags.DEFINE_string(
-    'mode', default='train_and_eval',
-    help='One of {"train_and_eval", "train", "eval"}.')
-
+    'num_eval_images', default=50000, help='Size of evaluation data set.')
 flags.DEFINE_integer(
-    'steps_per_eval', default=1251,
+    'num_label_classes', default=1000, help='Number of classes, at least 2')
+flags.DEFINE_integer(
+    'steps_per_eval',
+    default=1251,
     help=('Controls how often evaluation is performed. Since evaluation is'
           ' fairly expensive, it is advised to evaluate as infrequently as'
           ' possible (i.e. up to --train_steps, which evaluates the model only'
           ' after finishing the entire training regime).'))
-
-flags.DEFINE_integer(
-    'eval_timeout',
-    default=None,
-    help='Maximum seconds between checkpoints before evaluation terminates.')
-
-flags.DEFINE_integer(
-    'num_parallel_calls', default=None,
-    help=('Number of parallel threads in CPU for the input pipeline.'
-          ' Recommended value is the number of cores per CPU host.'))
-
-flags.DEFINE_integer(
-    'num_cores', default=None,
-    help=('Number of TPU cores in total. For a single TPU device, this is 8'
-          ' because each TPU has 4 chips each with 2 cores.'))
-
-flags.DEFINE_string(
-    'bigtable_project', None,
-    'The Cloud Bigtable project.  If None, --gcp_project will be used.')
-flags.DEFINE_string(
-    'bigtable_instance', None,
-    'The Cloud Bigtable instance to load data from.')
-flags.DEFINE_string(
-    'bigtable_table', 'imagenet',
-    'The Cloud Bigtable table to load data from.')
-flags.DEFINE_string(
-    'bigtable_train_prefix', 'train_',
-    'The prefix identifying training rows.')
-flags.DEFINE_string(
-    'bigtable_eval_prefix', 'validation_',
-    'The prefix identifying evaluation rows.')
-flags.DEFINE_string(
-    'bigtable_column_family', 'tfexample',
-    'The column family storing TFExamples.')
-flags.DEFINE_string(
-    'bigtable_column_qualifier', 'example',
-    'The column name storing TFExamples.')
-
-flags.DEFINE_string(
-    'export_dir',
-    default=None,
-    help=('The directory where the exported SavedModel will be stored.'))
-
 flags.DEFINE_bool(
-    'export_to_tpu', default=False,
-    help=('Whether to export additional metagraph with "serve, tpu" tags'
-          ' in addition to "serve" only metagraph.'))
+    'use_tpu',
+    default=False,
+    help=('Use TPU to execute the model for training and evaluation. If'
+          ' --use_tpu=false, will use whatever devices are available to'
+          ' TensorFlow by default (e.g. CPU and GPU)'))
+flags.DEFINE_integer(
+    'iterations_per_loop',
+    default=1251,
+    help=('Number of steps to run on TPU before outfeeding metrics to the CPU.'
+          ' If the number of iterations in the loop would exceed the number of'
+          ' train steps, the loop will exit before reaching'
+          ' --iterations_per_loop. The larger this value is, the higher the'
+          ' utilization on the TPU.'))
+flags.DEFINE_integer(
+    'num_parallel_calls',
+    default=64,
+    help=('Number of parallel threads in CPU for the input pipeline'))
+flags.DEFINE_integer(
+    'num_cores',
+    default=8,
+    help=('Number of TPU cores. For a single TPU device, this is 8 because each'
+          ' TPU has 4 chips each with 2 cores.'))
+flags.DEFINE_string('output_dir', '/tmp/imagenet/',
+                    'Directory where to write event logs and checkpoint.')
+flags.DEFINE_integer(
+    'checkpoint_step',
+    128000,
+    'Checkpoint step to evaluate for mode=\'eval_once\'')
+flags.DEFINE_string(
+    'mode',
+    default='train',
+    help='One of {"eval_once", "train_and_eval", "train", "eval"}.')
+flags.DEFINE_integer('export_model_freq', 2502,
+                     'The rate at which estimator exports the model.')
 
-flags.DEFINE_float(
-    'base_learning_rate', default=None,
-    help=('Base learning rate when train batch size is 256.'))
-
-flags.DEFINE_float(
-    'momentum', default=None,
-    help=('Momentum parameter used in the MomentumOptimizer.'))
-
-flags.DEFINE_float(
-    'weight_decay', default=None,
-    help=('Weight decay coefficiant for l2 regularization.'))
-
-flags.DEFINE_float(
-    'label_smoothing', default=None,
-    help=('Label smoothing parameter used in the softmax_cross_entropy'))
-
-flags.DEFINE_bool('enable_lars',
-                  default=None,
-                  help=('Enable LARS optimizer for large batch training.'))
-
-flags.DEFINE_float('poly_rate', default=None,
-                   help=('Set LARS/Poly learning rate.'))
-
+# pruning flags
+flags.DEFINE_float('end_sparsity', 0.9,
+                   'Target sparsity desired by end of training.')
+flags.DEFINE_integer('sparsity_begin_step', 5000, 'Step to begin pruning at.')
+flags.DEFINE_integer('sparsity_end_step', 8000, 'Step to end pruning at.')
+flags.DEFINE_integer('pruning_frequency', 2000,
+                     'Step interval between pruning.')
+flags.DEFINE_enum(
+    'pruning_method', 'baseline',
+    ('baseline', 'threshold', 'variational_dropout', 'l0_regularization'),
+    'Method used for pruning. baseline means no pruning is used.')
+flags.DEFINE_enum(
+    'init_method', 'baseline', ('baseline', 'sparse'),
+    'Method for initialization.  If sparse and pruning_method=scratch, then'
+    ' use initializers that take into account starting sparsity.')
+flags.DEFINE_float('reg_scalar', 0., 'Weight placed on variational dropout'
+                   'regularizer.')
+flags.DEFINE_float('clip_log_alpha', 8.0, 'Threshold for clipping log alpha.')
+flags.DEFINE_float('log_alpha_threshold', 3.0,
+                   'Threshold for thresholding log alpha during eval.')
 flags.DEFINE_bool(
-    'use_async_checkpointing', default=None, help=('Enable async checkpoint'))
+    'is_warm_up',
+    default=True,
+    help=('Boolean for whether to scale weight of regularizer.'))
+flags.DEFINE_float(
+    'width', -1., 'Multiplier for the number of channels in each layer.')
+# first and last layer are somewhat special.  First layer has almost no
+# parameters, but 3% of the total flops.  Last layer has only .05% of the total
+# flops but 10% of the total parameters.  Depending on whether the goal is max
+# compression or max acceleration, pruning goals will be different.
+flags.DEFINE_bool('prune_first_layer', True,
+                  'Whether or not to apply sparsification to the first layer')
+flags.DEFINE_bool('prune_last_layer', True,
+                  'Whether or not to apply sparsification to the last layer')
+flags.DEFINE_float(
+    'first_layer_sparsity', -1.,
+    'Sparsity to use for the first layer.  Overrides default of end_sparsity.')
+flags.DEFINE_float(
+    'last_layer_sparsity', -1.,
+    'Sparsity to use for the last layer. Overrides default of end_sparsity.')
+flags.DEFINE_string(
+    'load_mask_dir', '',
+    'Directory of a trained model from which to load only the mask')
+flags.DEFINE_string(
+    'initial_value_checkpoint', '',
+    'Directory of a model from which to load only the parameters')
 
-flags.DEFINE_integer('log_step_count_steps', 64, 'The number of steps at '
-                     'which the global step information is logged.')
+FLAGS = flags.FLAGS
 
-# Inference configuration.
-flags.DEFINE_bool(
-    'add_warmup_requests', False,
-    'Whether to add warmup requests into the export saved model dir,'
-    'especially for TPU inference.')
-flags.DEFINE_string('model_name', 'resnet',
-                    'Serving model name used for the model server.')
-flags.DEFINE_multi_integer(
-    'inference_batch_sizes', [8],
-    'Known inference batch sizes used to warm up for each core.')
-
+# Learning rate schedule (multiplier, epoch to start) tuples
+LR_SCHEDULE = [(1.0, 5), (0.1, 30), (0.01, 60), (0.001, 80)]
 
 # The input tensor is in the range of [0, 255], we need to scale them to the
 # range of [0, 1]
 MEAN_RGB = [0.485 * 255, 0.456 * 255, 0.406 * 255]
 STDDEV_RGB = [0.229 * 255, 0.224 * 255, 0.225 * 255]
 
+# TODO(shooker): verify hyperparameter defaults once code is stabilized.
+# lr_schedule = learning_rate_schedule + get_lr_schedule in original file
+def lr_schedule(current_epoch):
+  """Computes learning rate schedule."""
+  scaled_lr = FLAGS.base_learning_rate * (FLAGS.train_batch_size / 256.0)
 
-def get_lr_schedule(train_steps, num_train_images, train_batch_size):
-  """learning rate schedule."""
-  steps_per_epoch = np.floor(num_train_images / train_batch_size)
-  train_epochs = train_steps / steps_per_epoch
-  return [  # (multiplier, epoch to start) tuples
-      (1.0, np.floor(5 / 90 * train_epochs)),
-      (0.1, np.floor(30 / 90 * train_epochs)),
-      (0.01, np.floor(60 / 90 * train_epochs)),
-      (0.001, np.floor(80 / 90 * train_epochs))
-  ]
-
-
-def learning_rate_schedule(params, current_epoch):
-  """Handles linear scaling rule, gradual warmup, and LR decay.
-
-  The learning rate starts at 0, then it increases linearly per step.
-  After 5 epochs we reach the base learning rate (scaled to account
-    for batch size).
-  After 30, 60 and 80 epochs the learning rate is divided by 10.
-  After 90 epochs training stops and the LR is set to 0. This ensures
-    that we train for exactly 90 epochs for reproducibility.
-
-  Args:
-    params: Python dict containing parameters for this run.
-    current_epoch: `Tensor` for current epoch.
-
-  Returns:
-    A scaled `Tensor` for current learning rate.
-  """
-  scaled_lr = params['base_learning_rate'] * (
-      params['train_batch_size'] / 256.0)
-
-  lr_schedule = get_lr_schedule(
-      train_steps=params['train_steps'],
-      num_train_images=params['num_train_images'],
-      train_batch_size=params['train_batch_size'])
-  decay_rate = (scaled_lr * lr_schedule[0][0] *
-                current_epoch / lr_schedule[0][1])
-  for mult, start_epoch in lr_schedule:
-    decay_rate = tf.where(current_epoch < start_epoch,
-                          decay_rate, scaled_lr * mult)
+  decay_rate = (
+      scaled_lr * LR_SCHEDULE[0][0] * current_epoch / LR_SCHEDULE[0][1])
+  for mult, start_epoch in LR_SCHEDULE:
+    decay_rate = tf.where(current_epoch < start_epoch, decay_rate,
+                          scaled_lr * mult)
   return decay_rate
 
 
-def resnet_model_fn(features, labels, mode, params):
-  """The model_fn for ResNet to be used with TPUEstimator.
+def train_function(pruning_method, loss, output_dir, use_tpu):
+  """Training script for resnet model.
 
   Args:
-    features: `Tensor` of batched images. If transpose_input is enabled, it
-        is transposed to device layout and reshaped to 1D tensor.
-    labels: `Tensor` of labels for the data samples
-    mode: one of `tf.estimator.ModeKeys.{TRAIN,EVAL,PREDICT}`
-    params: `dict` of parameters passed to the model from the TPUEstimator,
-        `params['batch_size']` is always provided and should be used as the
-        effective batch size.
+   pruning_method: string indicating pruning method used to compress model.
+   loss: tensor float32 of the cross entropy + regularization losses.
+   output_dir: string tensor indicating the directory to save summaries.
+   use_tpu: boolean indicating whether to run script on a tpu.
 
   Returns:
-    A `TPUEstimatorSpec` for the model
+    host_call: summary tensors to be computed at each training step.
+    train_op: the optimization term.
   """
+
+  global_step = tf.train.get_global_step()
+
+  steps_per_epoch = FLAGS.num_train_images / FLAGS.train_batch_size
+  current_epoch = (tf.cast(global_step, tf.float32) / steps_per_epoch)
+  learning_rate = lr_schedule(current_epoch)
+  # ignore the lars_optimzier part
+
+  optimizer = tf.train.MomentumOptimizer(
+      learning_rate=learning_rate, momentum=FLAGS.momentum, use_nesterov=True)
+
+  if use_tpu:
+    # use CrossShardOptimizer when using TPU.
+    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+
+  # UPDATE_OPS needs to be added as a dependency due to batch norm
+  update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+  with tf.control_dependencies(update_ops), tf.name_scope('train'):
+    train_op = optimizer.minimize(loss, global_step)
+
+  if not use_tpu:
+    if FLAGS.num_workers > 0:
+      optimizer = tf.train.SyncReplicasOptimizer(
+          optimizer,
+          replicas_to_aggregate=FLAGS.num_workers,
+          total_num_replicas=FLAGS.num_workers)
+      optimizer.make_session_run_hook(True)
+
+  metrics = {
+      'global_step': tf.train.get_or_create_global_step(),
+      'loss': loss,
+      'learning_rate': learning_rate,
+      'current_epoch': current_epoch
+  }
+
+  # Not sure about this part
+  # host_call?
+  if pruning_method == 'threshold':
+    # construct the necessary hparams string from the FLAGS
+    hparams_string = ('begin_pruning_step={0},'
+                      'sparsity_function_begin_step={0},'
+                      'end_pruning_step={1},'
+                      'sparsity_function_end_step={1},'
+                      'target_sparsity={2},'
+                      'pruning_frequency={3},'
+                      'threshold_decay=0,'
+                      'use_tpu={4}'.format(
+                          FLAGS.sparsity_begin_step,
+                          FLAGS.sparsity_end_step,
+                          FLAGS.end_sparsity,
+                          FLAGS.pruning_frequency,
+                          FLAGS.use_tpu,
+                      ))
+
+    # Parse pruning hyperparameters
+    pruning_hparams = pruning.get_pruning_hparams().parse(hparams_string)
+
+    # The first layer has so few parameters, we don't need to prune it, and
+    # pruning it a higher sparsity levels has very negative effects.
+    if FLAGS.prune_first_layer and FLAGS.first_layer_sparsity >= 0.:
+      pruning_hparams.set_hparam(
+          'weight_sparsity_map',
+          ['resnet_model/initial_conv:%f' % FLAGS.first_layer_sparsity])
+    if FLAGS.prune_last_layer and FLAGS.last_layer_sparsity >= 0:
+      pruning_hparams.set_hparam(
+          'weight_sparsity_map',
+          ['resnet_model/final_dense:%f' % FLAGS.last_layer_sparsity])
+
+    # Create a pruning object using the pruning hyperparameters
+    pruning_obj = pruning.Pruning(pruning_hparams, global_step=global_step)
+
+    # We override the train op to also update the mask.
+    with tf.control_dependencies([train_op]):
+      train_op = pruning_obj.conditional_mask_update_op()
+
+    masks = pruning.get_masks()
+    metrics.update(utils.mask_summaries(masks))
+  elif pruning_method == 'scratch':
+    masks = pruning.get_masks()
+    # make sure the masks have the sparsity we expect and that it doesn't change
+    metrics.update(utils.mask_summaries(masks))
+  elif pruning_method == 'variational_dropout':
+    masks = utils.add_vd_pruning_summaries(threshold=FLAGS.log_alpha_threshold)
+    metrics.update(masks)
+  elif pruning_method == 'l0_regularization':
+    summaries = utils.add_l0_summaries()
+    metrics.update(summaries)
+  elif pruning_method == 'baseline':
+    pass
+  else:
+    raise ValueError('Unsupported pruning method', FLAGS.pruning_method)
+
+  host_call = (functools.partial(utils.host_call_fn, output_dir),
+               utils.format_tensors(metrics))
+
+  return host_call, train_op
+
+# compare with resnet_model_fn function
+def resnet_model_fn_w_pruning(features, labels, mode, params):
+  """The model_fn for ResNet-50 with pruning.
+
+  Args:
+    features: A float32 batch of images.
+    labels: A int32 batch of labels.
+    mode: Specifies whether training or evaluation.
+    params: Dictionary of parameters passed to the model.
+
+  Returns:
+    A TPUEstimatorSpec for the model
+  """
+
+  width = 1. if FLAGS.width <= 0 else FLAGS.width
   if isinstance(features, dict):
     features = features['feature']
 
@@ -271,11 +370,13 @@ def resnet_model_fn(features, labels, mode, params):
   # used for a significant performance boost on GPU/TPU. NHWC should be used
   # only if the network needs to be run on CPU since the pooling operations
   # are only supported on NHWC.
-  if params['data_format'] == 'channels_first':
-    assert not params['transpose_input']    # channels_first only for GPU
+
+  if FLAGS.data_format == 'channels_first':
+    assert not FLAGS.transpose_input  # channels_first only for GPU
     features = tf.transpose(features, [0, 3, 1, 2])
 
-  if params['transpose_input'] and mode != tf.estimator.ModeKeys.PREDICT:
+  if FLAGS.transpose_input and mode != tf.estimator.ModeKeys.PREDICT:
+    # import following two lines from latest resnet_main.py
     image_size = tf.sqrt(tf.shape(features)[0] / (3 * tf.shape(labels)[0]))
     features = tf.reshape(features, [image_size, image_size, 3, -1])
     features = tf.transpose(features, [3, 0, 1, 2])  # HWCN to NHWC
@@ -284,45 +385,43 @@ def resnet_model_fn(features, labels, mode, params):
   features -= tf.constant(MEAN_RGB, shape=[1, 1, 3], dtype=features.dtype)
   features /= tf.constant(STDDEV_RGB, shape=[1, 1, 3], dtype=features.dtype)
 
-  # DropBlock keep_prob for the 4 block groups of ResNet architecture.
-  # None means applying no DropBlock at the corresponding block group.
-  dropblock_keep_probs = [None] * 4
-  if params['dropblock_groups']:
-    # Scheduled keep_prob for DropBlock.
-    train_steps = tf.cast(params['train_steps'], tf.float32)
-    current_step = tf.cast(tf.train.get_global_step(), tf.float32)
-    current_ratio = current_step / train_steps
-    dropblock_keep_prob = (1 - current_ratio * (
-        1 - params['dropblock_keep_prob']))
+  #Ignore the DropBlock part in the original code
+  pruning_method = params['pruning_method']
+  use_tpu = params['use_tpu']
+  log_alpha_threshold = params['log_alpha_threshold']
 
-    # Computes DropBlock keep_prob for different block groups of ResNet.
-    dropblock_groups = [int(x) for x in params['dropblock_groups'].split(',')]
-    for block_group in dropblock_groups:
-      if block_group < 1 or block_group > 4:
-        raise ValueError(
-            'dropblock_groups should be a comma separated list of integers '
-            'between 1 and 4 (dropblcok_groups: {}).'
-            .format(params['dropblock_groups']))
-      dropblock_keep_probs[block_group - 1] = 1 - (
-          (1 - dropblock_keep_prob) / 4.0**(4 - block_group))
 
-  # This nested function allows us to avoid duplicating the logic which
-  # builds the network, for different values of --precision.
   def build_network():
-    network = resnet_model.resnet_v1(
-        resnet_depth=params['resnet_depth'],
-        num_classes=params['num_label_classes'],
-        dropblock_size=params['dropblock_size'],
-        dropblock_keep_probs=dropblock_keep_probs,
-        data_format=params['data_format'])
+    """Construct the network in the graph."""
+    model_pruning_method = pruning_method
+    if pruning_method == 'scratch':
+      model_pruning_method = 'threshold'
+
+    network = resnet_model.resnet_v1_(
+        resnet_depth=FLAGS.resnet_depth,
+        num_classes=FLAGS.num_label_classes,
+        # we need to construct the model with the pruning masks, but they won't
+        # be updated if we're doing scratch training
+        pruning_method=model_pruning_method,
+        init_method=FLAGS.init_method,
+        width=width,
+        prune_first_layer=FLAGS.prune_first_layer,
+        prune_last_layer=FLAGS.prune_last_layer,
+        data_format=FLAGS.data_format,
+        end_sparsity=FLAGS.end_sparsity,
+        clip_log_alpha=FLAGS.clip_log_alpha,
+        log_alpha_threshold=log_alpha_threshold,
+        weight_decay=FLAGS.weight_decay)
     return network(
         inputs=features, is_training=(mode == tf.estimator.ModeKeys.TRAIN))
 
-  if params['precision'] == 'bfloat16':
-    with tf.tpu.bfloat16_scope():
+  #https://www.tensorflow.org/versions/r1.14/api_docs/python/tf/tpu/bfloat16_scope
+  #https://www.tensorflow.org/versions/r1.14/api_docs/python/tf/dtypes/cast
+  if FLAGS.precision == 'bfloat16':
+    with tf.contrib.tpu.bfloat16_scope():
       logits = build_network()
     logits = tf.cast(logits, tf.float32)
-  elif params['precision'] == 'float32':
+  elif FLAGS.precision == 'float32':
     logits = build_network()
 
   if mode == tf.estimator.ModeKeys.PREDICT:
@@ -337,407 +436,362 @@ def resnet_model_fn(features, labels, mode, params):
             'classify': tf.estimator.export.PredictOutput(predictions)
         })
 
-  # If necessary, in the model_fn, use params['batch_size'] instead the batch
-  # size flags (--train_batch_size or --eval_batch_size).
-  batch_size = params['batch_size']   # pylint: disable=unused-variable
+  output_dir = params['output_dir']  # pylint: disable=unused-variable
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
-  one_hot_labels = tf.one_hot(labels, params['num_label_classes'])
-  cross_entropy = tf.losses.softmax_cross_entropy(
+  one_hot_labels = tf.one_hot(labels, FLAGS.num_label_classes)
+
+  # make sure we reuse the same label smoothing parameter is we're doing
+  # scratch / lottery ticket experiments.
+  label_smoothing = FLAGS.label_smoothing
+  if FLAGS.pruning_method == 'scratch':
+    label_smoothing = float(FLAGS.load_mask_dir.split('/')[15])
+  loss = tf.losses.softmax_cross_entropy(
       logits=logits,
       onehot_labels=one_hot_labels,
-      label_smoothing=params['label_smoothing'])
+      label_smoothing=label_smoothing)
+  # Add regularization loss term
+  loss += tf.losses.get_regularization_loss()
 
-  # Add weight decay to the loss for non-batch-normalization variables.
-  if params['enable_lars']:
-    loss = cross_entropy
-  else:
-    loss = cross_entropy + params['weight_decay'] * tf.add_n([
-        tf.nn.l2_loss(v)
-        for v in tf.trainable_variables()
-        if 'batch_normalization' not in v.name
-    ])
+  # https://github.com/tensorflow/tpu/blob/25edc954ecb2abba37b48a2171d4bb64ff0421ad/models/official/resnet/resnet_main.py#L351-L359
+  if pruning_method == 'variational_dropout':
+    reg_loss = utils.variational_dropout_dkl_loss(
+        reg_scalar=FLAGS.reg_scalar,
+        start_reg_ramp_up=FLAGS.sparsity_begin_step,
+        end_reg_ramp_up=FLAGS.sparsity_end_step,
+        warm_up=FLAGS.is_warm_up,
+        use_tpu=use_tpu)
+    loss += reg_loss
+    tf.losses.add_loss(reg_loss, loss_collection=tf.GraphKeys.LOSSES)
+  elif pruning_method == 'l0_regularization':
+    reg_loss = utils.l0_regularization_loss(
+        reg_scalar=FLAGS.reg_scalar,
+        start_reg_ramp_up=FLAGS.sparsity_begin_step,
+        end_reg_ramp_up=FLAGS.sparsity_end_step,
+        warm_up=FLAGS.is_warm_up,
+        use_tpu=use_tpu)
+    loss += reg_loss
+    tf.losses.add_loss(reg_loss, loss_collection=tf.GraphKeys.LOSSES)
 
+  # https://github.com/tensorflow/tpu/blob/25edc954ecb2abba37b48a2171d4bb64ff0421ad/models/official/resnet/resnet_main.py#L362-L441
   host_call = None
   if mode == tf.estimator.ModeKeys.TRAIN:
-    # Compute the current epoch and associated learning rate from global_step.
-    global_step = tf.train.get_global_step()
-    steps_per_epoch = params['num_train_images'] / params['train_batch_size']
-    current_epoch = (tf.cast(global_step, tf.float32) /
-                     steps_per_epoch)
-    # LARS is a large batch optimizer. LARS enables higher accuracy at batch 16K
-    # and larger batch sizes.
-    if params['enable_lars']:
-      learning_rate = 0.0
-      optimizer = lars_util.init_lars_optimizer(current_epoch, params)
-    else:
-      learning_rate = learning_rate_schedule(params, current_epoch)
-      optimizer = tf.train.MomentumOptimizer(
-          learning_rate=learning_rate,
-          momentum=params['momentum'],
-          use_nesterov=True)
-    if params['use_tpu']:
-      # When using TPU, wrap the optimizer with CrossShardOptimizer which
-      # handles synchronization details between different TPU cores. To the
-      # user, this should look like regular synchronous training.
-      optimizer = tf.tpu.CrossShardOptimizer(optimizer)
-
-    # Batch normalization requires UPDATE_OPS to be added as a dependency to
-    # the train operation.
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step)
-
-    if not params['skip_host_call']:
-      def host_call_fn(gs, loss, lr, ce):
-        """Training host call. Creates scalar summaries for training metrics.
-
-        This function is executed on the CPU and should not directly reference
-        any Tensors in the rest of the `model_fn`. To pass Tensors from the
-        model to the `metric_fn`, provide as part of the `host_call`. See
-        https://www.tensorflow.org/api_docs/python/tf/estimator/tpu/TPUEstimatorSpec
-        for more information.
-
-        Arguments should match the list of `Tensor` objects passed as the second
-        element in the tuple passed to `host_call`.
-
-        Args:
-          gs: `Tensor with shape `[batch]` for the global_step
-          loss: `Tensor` with shape `[batch]` for the training loss.
-          lr: `Tensor` with shape `[batch]` for the learning_rate.
-          ce: `Tensor` with shape `[batch]` for the current_epoch.
-
-        Returns:
-          List of summary ops to run on the CPU host.
-        """
-        gs = gs[0]
-        # Host call fns are executed params['iterations_per_loop'] times after
-        # one TPU loop is finished, setting max_queue value to the same as
-        # number of iterations will make the summary writer only flush the data
-        # to storage once per loop.
-        with tf2.summary.create_file_writer(
-            FLAGS.model_dir,
-            max_queue=params['iterations_per_loop']).as_default():
-          with tf2.summary.record_if(True):
-            tf2.summary.scalar('loss', loss[0], step=gs)
-            tf2.summary.scalar('learning_rate', lr[0], step=gs)
-            tf2.summary.scalar('current_epoch', ce[0], step=gs)
-
-          return tf.summary.all_v2_summary_ops()
-
-      # To log the loss, current learning rate, and epoch for Tensorboard, the
-      # summary op needs to be run on the host CPU via host_call. host_call
-      # expects [batch_size, ...] Tensors, thus reshape to introduce a batch
-      # dimension. These Tensors are implicitly concatenated to
-      # [params['batch_size']].
-      gs_t = tf.reshape(global_step, [1])
-      loss_t = tf.reshape(loss, [1])
-      lr_t = tf.reshape(learning_rate, [1])
-      ce_t = tf.reshape(current_epoch, [1])
-
-      host_call = (host_call_fn, [gs_t, loss_t, lr_t, ce_t])
-
+    host_call, train_op = train_function(pruning_method, loss, output_dir,
+                                         use_tpu)
   else:
     train_op = None
 
   eval_metrics = None
   if mode == tf.estimator.ModeKeys.EVAL:
+
     def metric_fn(labels, logits):
-      """Evaluation metric function. Evaluates accuracy.
+      """Calculate eval metrics."""
+      logging.info('In metric function')
+      eval_metrics = {}
+      predictions = tf.cast(tf.argmax(logits, axis=1), tf.int32)
 
-      This function is executed on the CPU and should not directly reference
-      any Tensors in the rest of the `model_fn`. To pass Tensors from the model
-      to the `metric_fn`, provide as part of the `eval_metrics`. See
-      https://www.tensorflow.org/api_docs/python/tf/estimator/tpu/TPUEstimatorSpec
-      for more information.
-
-      Arguments should match the list of `Tensor` objects passed as the second
-      element in the tuple passed to `eval_metrics`.
-
-      Args:
-        labels: `Tensor` with shape `[batch]`.
-        logits: `Tensor` with shape `[batch, num_classes]`.
-
-      Returns:
-        A dict of the metrics to return from evaluation.
-      """
-      predictions = tf.argmax(logits, axis=1)
       top_1_accuracy = tf.metrics.accuracy(labels, predictions)
       in_top_5 = tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32)
       top_5_accuracy = tf.metrics.mean(in_top_5)
 
-      return {
-          'top_1_accuracy': top_1_accuracy,
-          'top_5_accuracy': top_5_accuracy,
-      }
+      #eval_metrics['top_1_eval_accuracy'] = top_1_accuracy
+      eval_metrics['top_5_eval_accuracy'] = top_5_accuracy
+      # top_1_eval_accuracy
+      eval_metrics['eval_accuracy'] = tf.metrics.accuracy(
+          labels=labels, predictions=predictions)
 
-    eval_metrics = (metric_fn, [labels, logits])
+      return eval_metrics
 
-  return tf.estimator.tpu.TPUEstimatorSpec(
+    def vd_metric_fn(labels, logits, global_sparsity):
+      eval_metrics = metric_fn(labels, logits)
+      eval_metrics['global_sparsity'] = tf.metrics.mean(global_sparsity)
+      return eval_metrics
+
+    tensors = [labels, logits]
+    metric_function = metric_fn
+
+    if FLAGS.pruning_method == 'variational_dropout':
+      batch_size = labels.shape[0]
+      ones = tf.ones([batch_size, 1])
+      mask_metrics = utils.add_vd_pruning_summaries(
+          threshold=FLAGS.log_alpha_threshold)
+      tensors.append(mask_metrics['global_sparsity'] * ones)
+      metric_function = vd_metric_fn
+
+    eval_metrics = (metric_function, tensors)
+
+  # define a custom scaffold function to enable initializing the mask from an
+  # already trained checkpoint.
+  def initialize_mask_from_ckpt(ckpt_path):
+    """Load mask from an existing checkpoint."""
+    model_dir = FLAGS.output_dir
+    already_has_ckpt = model_dir and tf.train.latest_checkpoint(
+        model_dir) is not None
+    if already_has_ckpt:
+      tf.logging.info(
+          'Training already started on this model, not loading masks from'
+          'previously trained model')
+      return
+
+    reader = tf.train.NewCheckpointReader(ckpt_path)
+    mask_names = reader.get_variable_to_shape_map().keys()
+    mask_names = [x for x in mask_names if x.endswith('mask')]
+
+    variable_map = {}
+    for var in tf.global_variables():
+      var_name = var.name.split(':')[0]
+      if var_name in mask_names:
+        tf.logging.info('Loading mask variable from checkpoint: %s', var_name)
+        variable_map[var_name] = var
+      elif 'mask' in var_name:
+        tf.logging.info('Cannot find mask variable in checkpoint, skipping: %s',
+                        var_name)
+    tf.train.init_from_checkpoint(ckpt_path, variable_map)
+
+  def initialize_parameters_from_ckpt(ckpt_path):
+    """Load parameters from an existing checkpoint."""
+    model_dir = FLAGS.output_dir
+    already_has_ckpt = model_dir and tf.train.latest_checkpoint(
+        model_dir) is not None
+    if already_has_ckpt:
+      tf.logging.info(
+          'Training already started on this model, not loading masks from'
+          'previously trained model')
+      return
+
+    reader = tf.train.NewCheckpointReader(ckpt_path)
+    param_names = reader.get_variable_to_shape_map().keys()
+    param_names = [x for x in param_names if not x.endswith('mask')]
+
+    variable_map = {}
+    for var in tf.global_variables():
+      var_name = var.name.split(':')[0]
+      if var_name in param_names:
+        tf.logging.info('Loading parameter variable from checkpoint: %s',
+                        var_name)
+        variable_map[var_name] = var
+      elif 'mask' not in var_name:
+        tf.logging.info(
+            'Cannot find parameter variable in checkpoint, skipping: %s',
+            var_name)
+    tf.train.init_from_checkpoint(ckpt_path, variable_map)
+
+  if FLAGS.pruning_method == 'scratch':
+    if FLAGS.load_mask_dir:
+
+      def scaffold_fn():
+        initialize_mask_from_ckpt(FLAGS.load_mask_dir)
+        if FLAGS.initial_value_checkpoint:
+          initialize_parameters_from_ckpt(FLAGS.initial_value_checkpoint)
+        return tf.train.Scaffold()
+    else:
+      raise ValueError('Must supply a mask directory to use scratch method')
+  else:
+    scaffold_fn = None
+
+  #[Houxiang]check scaffold_fn attribute of the TPUEstimatorSpec
+  return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
       host_call=host_call,
-      eval_metrics=eval_metrics)
+      eval_metrics=eval_metrics,
+      scaffold_fn=scaffold_fn)
 
 
-def _verify_non_empty_string(value, field_name):
-  """Ensures that a given proposed field value is a non-empty string.
+class ExportModelHook(tf.train.SessionRunHook):
+  """Train hooks called after each session run for exporting the model."""
 
-  Args:
-    value:  proposed value for the field.
-    field_name:  string name of the field, e.g. `project`.
+  def __init__(self, classifier, export_dir):
+    self.classifier = classifier
+    self.global_step = None
+    self.export_dir = export_dir
+    self.last_export = 0
+    self.supervised_input_receiver_fn = (
+        tf.contrib.estimator.build_raw_supervised_input_receiver_fn({
+            'feature':
+                tf.placeholder(dtype=tf.float32, shape=[None, 224, 224, 3])
+        }, tf.placeholder(dtype=tf.int32, shape=[None])))
 
-  Returns:
-    The given value, provided that it passed the checks.
+  def begin(self):
+    self.global_step = tf.train.get_or_create_global_step()
 
-  Raises:
-    ValueError:  the value is not a string, or is a blank string.
-  """
-  if not isinstance(value, str):
-    raise ValueError(
-        'Bigtable parameter "%s" must be a string.' % field_name)
-  if not value:
-    raise ValueError(
-        'Bigtable parameter "%s" must be non-empty.' % field_name)
-  return value
+  def after_run(self, run_context, run_values):
+    # export saved model
+    global_step = run_context.session.run(self.global_step)
+
+    if global_step - self.last_export >= FLAGS.export_model_freq:
+      tf.logging.info(
+          'Export model for prediction (step={}) ...'.format(global_step))
+
+      self.last_export = global_step
+      tf.contrib.estimator.export_all_saved_models(
+          self.classifier,
+          os.path.join(self.export_dir, str(global_step)), {
+              tf.estimator.ModeKeys.EVAL:
+                  self.supervised_input_receiver_fn,
+              tf.estimator.ModeKeys.PREDICT:
+                  imagenet_input.image_serving_input_fn
+          })
 
 
-def _select_tables_from_flags():
-  """Construct training and evaluation Bigtable selections from flags.
+def main(_):
 
-  Returns:
-    [training_selection, evaluation_selection]
-  """
-  project = _verify_non_empty_string(
-      FLAGS.bigtable_project or FLAGS.gcp_project,
-      'project')
-  instance = _verify_non_empty_string(FLAGS.bigtable_instance, 'instance')
-  table = _verify_non_empty_string(FLAGS.bigtable_table, 'table')
-  train_prefix = _verify_non_empty_string(FLAGS.bigtable_train_prefix,
-                                          'train_prefix')
-  eval_prefix = _verify_non_empty_string(FLAGS.bigtable_eval_prefix,
-                                         'eval_prefix')
-  column_family = _verify_non_empty_string(FLAGS.bigtable_column_family,
-                                           'column_family')
-  column_qualifier = _verify_non_empty_string(FLAGS.bigtable_column_qualifier,
-                                              'column_qualifier')
-  return [  # pylint: disable=g-complex-comprehension
-      imagenet_input.BigtableSelection(
-          project=project,
-          instance=instance,
-          table=table,
-          prefix=p,
-          column_family=column_family,
-          column_qualifier=column_qualifier)
-      for p in (train_prefix, eval_prefix)
+  if FLAGS.pruning_method in ['threshold']:
+    folder_stub = os.path.join(FLAGS.pruning_method, str(FLAGS.end_sparsity),
+                               str(FLAGS.sparsity_begin_step),
+                               str(FLAGS.sparsity_end_step),
+                               str(FLAGS.pruning_frequency),
+                               str(FLAGS.label_smoothing))
+  elif FLAGS.pruning_method == 'variational_dropout':
+    folder_stub = os.path.join(FLAGS.pruning_method,
+                               str(FLAGS.sparsity_begin_step),
+                               str(FLAGS.sparsity_end_step),
+                               str(FLAGS.reg_scalar),
+                               str(FLAGS.label_smoothing))
+  elif FLAGS.pruning_method == 'l0_regularization':
+    folder_stub = os.path.join(FLAGS.pruning_method,
+                               str(FLAGS.sparsity_begin_step),
+                               str(FLAGS.sparsity_end_step),
+                               str(FLAGS.reg_scalar),
+                               str(FLAGS.label_smoothing))
+  elif FLAGS.pruning_method == 'baseline':
+    folder_stub = os.path.join(FLAGS.pruning_method, str(0.0), str(0.0),
+                               str(0.0), str(0.0))
+  elif FLAGS.pruning_method == 'scratch':
+    run_info = FLAGS.load_mask_dir.split('/')
+    run_type = run_info[10]
+    run_sparsity = run_info[11]
+    run_begin = run_info[12]
+    run_end = run_info[13]
+    run_freq = run_info[14]
+    run_label_smoothing = run_info[15]
+    folder_stub = os.path.join(FLAGS.pruning_method, run_type, run_sparsity,
+                               run_begin, run_end, run_freq,
+                               run_label_smoothing, FLAGS.init_method)
+  else:
+    raise ValueError('Pruning method is not known %s' % (FLAGS.pruning_method))
+
+  output_dir = os.path.join(FLAGS.output_dir, folder_stub)
+
+  export_dir = os.path.join(output_dir, 'export_dir')
+
+  # we pass the updated eval and train string to the params dictionary.
+  params = {}
+  params['output_dir'] = output_dir
+  params['pruning_method'] = FLAGS.pruning_method
+  params['use_tpu'] = FLAGS.use_tpu
+  params['log_alpha_threshold'] = FLAGS.log_alpha_threshold
+
+  imagenet_train, imagenet_eval = [
+      imagenet_input.ImageNetInput(  # pylint: disable=g-complex-comprehension
+          is_training=is_training,
+          data_dir=FLAGS.data_directory,
+          transpose_input=False,
+          num_parallel_calls=FLAGS.num_parallel_calls,
+          use_bfloat16=False) for is_training in [True, False]
   ]
-
-
-def main(unused_argv):
-  params = params_dict.ParamsDict(
-      resnet_config.RESNET_CFG, resnet_config.RESNET_RESTRICTIONS)
-  params = params_dict.override_params_dict(
-      params, FLAGS.config_file, is_strict=True)
-  params = params_dict.override_params_dict(
-      params, FLAGS.params_override, is_strict=True)
-
-  params = flags_to_params.override_params_from_input_flags(params, FLAGS)
-
-  params.validate()
-  params.lock()
 
   tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
       FLAGS.tpu if (FLAGS.tpu or params.use_tpu) else '',
       zone=FLAGS.tpu_zone,
       project=FLAGS.gcp_project)
 
-  if params.use_async_checkpointing:
-    save_checkpoints_steps = None
-  else:
-    save_checkpoints_steps = max(5000, params.iterations_per_loop)
-  config = tf.estimator.tpu.RunConfig(
+  run_config = tpu_config.RunConfig(
+      #master = tf.contrib.cluster_resolver.TPUClusterResolver(tpu=[os.environ['TPU_NAME']]).get_master(),
       cluster=tpu_cluster_resolver,
-      model_dir=FLAGS.model_dir,
-      save_checkpoints_steps=save_checkpoints_steps,
-      log_step_count_steps=FLAGS.log_step_count_steps,
+      model_dir=output_dir,
+      save_checkpoints_steps=FLAGS.steps_per_checkpoint,
+      keep_checkpoint_max=FLAGS.keep_checkpoint_max,
       session_config=tf.ConfigProto(
-          graph_options=tf.GraphOptions(
-              rewrite_options=rewriter_config_pb2.RewriterConfig(
-                  disable_meta_optimizer=True))),
-      tpu_config=tf.estimator.tpu.TPUConfig(
-          iterations_per_loop=params.iterations_per_loop,
-          num_shards=params.num_cores,
-          per_host_input_for_training=tf.estimator.tpu.InputPipelineConfig
-          .PER_HOST_V2))  # pylint: disable=line-too-long
+          allow_soft_placement=True, log_device_placement=False),
+      tpu_config=tpu_config.TPUConfig(
+          iterations_per_loop=FLAGS.iterations_per_loop,
+          num_shards=FLAGS.num_cores,
+          tpu_job_name=FLAGS.tpu_job_name))
 
-  resnet_classifier = tf.estimator.tpu.TPUEstimator(
-      use_tpu=params.use_tpu,
-      model_fn=resnet_model_fn,
-      config=config,
-      params=params.as_dict(),
-      train_batch_size=params.train_batch_size,
-      eval_batch_size=params.eval_batch_size,
-      export_to_tpu=FLAGS.export_to_tpu)
+  classifier = tpu_estimator.TPUEstimator(
+      use_tpu=FLAGS.use_tpu,
+      model_fn=resnet_model_fn_w_pruning,
+      params=params,
+      config=run_config,
+      train_batch_size=FLAGS.train_batch_size,
+      eval_batch_size=FLAGS.eval_batch_size)
 
-  assert (params.precision == 'bfloat16' or
-          params.precision == 'float32'), (
-              'Invalid value for precision parameter; '
-              'must be bfloat16 or float32.')
-  tf.logging.info('Precision: %s', params.precision)
-  use_bfloat16 = params.precision == 'bfloat16'
+  cpu_classifier = tpu_estimator.TPUEstimator(
+      use_tpu=FLAGS.use_tpu,
+      model_fn=resnet_model_fn_w_pruning,
+      params=params,
+      config=run_config,
+      train_batch_size=FLAGS.train_batch_size,
+      export_to_tpu=False,
+      eval_batch_size=FLAGS.eval_batch_size)
 
-  # Input pipelines are slightly different (with regards to shuffling and
-  # preprocessing) between training and evaluation.
-  if FLAGS.bigtable_instance:
-    tf.logging.info('Using Bigtable dataset, table %s', FLAGS.bigtable_table)
-    select_train, select_eval = _select_tables_from_flags()
-    imagenet_train, imagenet_eval = [
-        imagenet_input.ImageNetBigtableInput(  # pylint: disable=g-complex-comprehension
-            is_training=is_training,
-            use_bfloat16=use_bfloat16,
-            transpose_input=params.transpose_input,
-            selection=selection)
-        for (is_training, selection) in [(True,
-                                          select_train), (False, select_eval)]
-    ]
-  else:
-    if FLAGS.data_dir == FAKE_DATA_DIR:
-      tf.logging.info('Using fake dataset.')
-    else:
-      tf.logging.info('Using dataset: %s', FLAGS.data_dir)
-    imagenet_train, imagenet_eval = [
-        imagenet_input.ImageNetInput(  # pylint: disable=g-complex-comprehension
-            is_training=is_training,
-            data_dir=FLAGS.data_dir,
-            transpose_input=params.transpose_input,
-            cache=params.use_cache and is_training,
-            image_size=params.image_size,
-            num_parallel_calls=params.num_parallel_calls,
-            include_background_label=(params.num_label_classes == 1001),
-            use_bfloat16=use_bfloat16) for is_training in [True, False]
-    ]
+  if FLAGS.num_eval_images % FLAGS.eval_batch_size != 0:
+    raise ValueError(
+        'eval_batch_size (%d) must evenly divide num_eval_images(%d)!' %
+        (FLAGS.eval_batch_size, FLAGS.num_eval_images))
 
-  steps_per_epoch = params.num_train_images // params.train_batch_size
-  eval_steps = params.num_eval_images // params.eval_batch_size
+  eval_steps = FLAGS.num_eval_images // FLAGS.eval_batch_size
 
-  if FLAGS.mode == 'eval':
-
-    # Run evaluation when there's a new checkpoint
-    for ckpt in tf.train.checkpoints_iterator(
-        FLAGS.model_dir, timeout=FLAGS.eval_timeout):
-      tf.logging.info('Starting to evaluate.')
-      try:
-        start_timestamp = time.time()  # This time will include compilation time
-        eval_results = resnet_classifier.evaluate(
-            input_fn=imagenet_eval.input_fn,
-            steps=eval_steps,
-            checkpoint_path=ckpt)
-        elapsed_time = int(time.time() - start_timestamp)
-        tf.logging.info('Eval results: %s. Elapsed seconds: %d',
+  #[Houxiang] Check the checkpoint model name
+  if FLAGS.mode == 'eval_once':
+    ckpt = FLAGS.output_dir + 'model.ckpt-{}'.format(FLAGS.checkpoint_step)
+    start_timestamp = time.time()
+    eval_results = classifier.evaluate(
+        input_fn=imagenet_eval.input_fn,
+        steps=eval_steps,
+        checkpoint_path=ckpt,
+        name='{0}'.format(int(FLAGS.log_alpha_threshold * 10)))
+    elapsed_time = int(time.time() - start_timestamp)
+    tf.logging.info('Eval results: %s. Elapsed seconds: %d',
                         eval_results, elapsed_time)
 
+  elif FLAGS.mode == 'eval':
+    # Run evaluation when there's a new checkpoint
+    for ckpt in evaluation.checkpoints_iterator(output_dir):
+      print('Starting to evaluate.')
+      try:
+        classifier.evaluate(
+            input_fn=imagenet_eval.input_fn,
+            steps=eval_steps,
+            checkpoint_path=ckpt,
+            name='{0}'.format(int(FLAGS.log_alpha_threshold * 10)))
         # Terminate eval job when final checkpoint is reached
-        current_step = int(os.path.basename(ckpt).split('-')[1])
-        if current_step >= params.train_steps:
-          tf.logging.info(
-              'Evaluation finished after training step %d', current_step)
+        global_step = int(os.path.basename(ckpt).split('-')[1])
+        if global_step >= FLAGS.train_steps:
+          print('Evaluation finished after training step %d' % global_step)
           break
 
       except tf.errors.NotFoundError:
-        # Since the coordinator is on a different job than the TPU worker,
-        # sometimes the TPU worker does not finish initializing until long after
-        # the CPU job tells it to start evaluating. In this case, the checkpoint
-        # file could have been deleted already.
-        tf.logging.info(
-            'Checkpoint %s no longer exists, skipping checkpoint', ckpt)
+        logging.info('Checkpoint no longer exists,skipping checkpoint.')
 
-  else:   # FLAGS.mode == 'train' or FLAGS.mode == 'train_and_eval'
-    try:
-      current_step = tf.train.load_variable(FLAGS.model_dir,
+  else:
+    global_step = tf.train.load_variable(FLAGS.output_dir,
                                             tf.GraphKeys.GLOBAL_STEP)
-    except (TypeError, ValueError, tf.errors.NotFoundError):
-      current_step = 0
-    steps_per_epoch = params.num_train_images // params.train_batch_size
-    tf.logging.info('Training for %d steps (%.2f epochs in total). Current'
-                    ' step %d.',
-                    params.train_steps,
-                    params.train_steps / steps_per_epoch,
-                    current_step)
-
-    start_timestamp = time.time()  # This time will include compilation time
+    #global_step = estimator._load_global_step_from_checkpoint_dir(output_dir)  # pylint: disable=protected-access,line-too-long
+    # Session run hooks to export model for prediction
+    export_hook = ExportModelHook(cpu_classifier, export_dir)
+    hooks = [export_hook]
 
     if FLAGS.mode == 'train':
-      hooks = []
-      if params.use_async_checkpointing:
-        try:
-          from tensorflow.contrib.tpu.python.tpu import async_checkpoint  # pylint: disable=g-import-not-at-top
-        except ImportError as e:
-          logging.exception(
-              'Async checkpointing is not supported in TensorFlow 2.x')
-          raise e
-
-        hooks.append(
-            async_checkpoint.AsyncCheckpointSaverHook(
-                checkpoint_dir=FLAGS.model_dir,
-                save_steps=max(5000, params.iterations_per_loop)))
-      if FLAGS.profile_every_n_steps > 0:
-        hooks.append(
-            tpu_profiler_hook.TPUProfilerHook(
-                save_steps=FLAGS.profile_every_n_steps,
-                output_dir=FLAGS.model_dir, tpu=FLAGS.tpu)
-            )
-      resnet_classifier.train(
+      print('start training...')
+      classifier.train(
           input_fn=imagenet_train.input_fn,
-          max_steps=params.train_steps,
-          hooks=hooks)
-
+          hooks=hooks,
+          max_steps=FLAGS.train_steps)
     else:
       assert FLAGS.mode == 'train_and_eval'
-      while current_step < params.train_steps:
-        # Train for up to steps_per_eval number of steps.
-        # At the end of training, a checkpoint will be written to --model_dir.
-        next_checkpoint = min(current_step + FLAGS.steps_per_eval,
-                              params.train_steps)
-        resnet_classifier.train(
+      print('start training and eval...')
+      while global_step < FLAGS.train_steps:
+        next_checkpoint = min(global_step + FLAGS.steps_per_eval,
+                              FLAGS.train_steps)
+        classifier.train(
             input_fn=imagenet_train.input_fn, max_steps=next_checkpoint)
-        current_step = next_checkpoint
-
-        tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
-                        next_checkpoint, int(time.time() - start_timestamp))
-
-        # Evaluate the model on the most recent model in --model_dir.
-        # Since evaluation happens in batches of --eval_batch_size, some images
-        # may be excluded modulo the batch size. As long as the batch size is
-        # consistent, the evaluated images are also consistent.
-        tf.logging.info('Starting to evaluate.')
-        eval_results = resnet_classifier.evaluate(
-            input_fn=imagenet_eval.input_fn,
-            steps=params.num_eval_images // params.eval_batch_size)
-        tf.logging.info('Eval results at step %d: %s',
-                        next_checkpoint, eval_results)
-
-      elapsed_time = int(time.time() - start_timestamp)
-      tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
-                      params.train_steps, elapsed_time)
-
-    if FLAGS.export_dir is not None:
-      # The guide to serve a exported TensorFlow model is at:
-      #    https://www.tensorflow.org/serving/serving_basic
-      tf.logging.info('Starting to export model.')
-      export_path = resnet_classifier.export_saved_model(
-          export_dir_base=FLAGS.export_dir,
-          serving_input_receiver_fn=imagenet_input.image_serving_input_fn)
-      if FLAGS.add_warmup_requests:
-        inference_warmup.write_warmup_requests(
-            export_path,
-            FLAGS.model_name,
-            params.image_size,
-            batch_sizes=FLAGS.inference_batch_sizes,
-            image_format='JPEG')
+        global_step = next_checkpoint
+        logging.info('Completed training up to step :%d', global_step)
+        classifier.evaluate(input_fn=imagenet_eval.input_fn, steps=eval_steps)
 
 
 if __name__ == '__main__':
-  tf.logging.set_verbosity(tf.logging.INFO)
-  tf.disable_v2_behavior()
   app.run(main)

@@ -23,12 +23,103 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.compat.v1 as tf
+# this is for TF 2.0
+#import tensorflow.compat.v1 as tf
+
+# [Houxiang] Add header, NOTE: We build on Tensorflow 1.14
+import math
+from absl import flags
+import tensorflow as tf
+from official.resnet.pruning_layers import sparse_conv2d
+from official.resnet.pruning_layers import sparse_fully_connected
+
+# https://github.com/tensorflow/tensorflow/tree/r1.14/tensorflow/python/ops
+from tensorflow.python.ops import init_ops # pylint: disable=g-direct-tensorflow-import
 
 BATCH_NORM_DECAY = 0.9
 BATCH_NORM_EPSILON = 1e-5
 
 
+#[Houxiang] Sparsity Code, TF 1.14 API: https://www.tensorflow.org/versions/r1.14/api_docs/python/tf
+# Initializer for Convolution Layer, You can test API availability on a weapon container
+class SparseConvVarianceScalingInitializer(init_ops.Initializer):
+  """Define an initializer for an already sparse layer."""
+
+  def __init__(self, sparsity, seed=None, dtype=tf.float32):
+    if sparsity < 0. or sparsity >= 1.:
+      raise ValueError('sparsity must be in the range [0., 1.).')
+
+    self.sparsity = sparsity
+    self.seed = seed
+    self.dtype = dtype  # [Houxiang] add dtype member
+
+  def __call__(self, shape, dtype=None, partition_info=None):
+    if partition_info is not None:
+      raise ValueError('partition_info not supported.')
+    if dtype is None:
+      dtype = self.dtype
+
+    # Calculate number of non-zero weights
+    nnz = 1.
+    for d in shape:
+      nnz *= d
+    nnz *= (1. - self.sparsity)
+
+    input_channels = shape[-2]
+    n = nnz / input_channels
+
+    variance = (2. / n)**.5
+
+    # random_normal is supported
+    return tf.random_normal(shape, 0, variance, dtype, seed=self.seed)
+
+  def get_config(self):
+    return {
+        'seed': self.seed,
+        'dtype': self.dtype.name,
+    }
+
+class SparseFCVarianceScalingInitializer(init_ops.Initializer):
+  """Define an initializer for an already sparse layer."""
+
+  def __init__(self, sparsity, seed=None, dtype=tf.float32):
+    if sparsity < 0. or sparsity >= 1.:
+      raise ValueError('sparsity must be in the range [0., 1.).')
+
+    self.sparsity = sparsity
+    self.seed = seed
+    self.dtype = dtype #add member
+
+  def __call__(self, shape, dtype=None, partition_info=None):
+    if partition_info is not None:
+      raise ValueError('partition_info not supported.')
+    if dtype is None:
+      dtype = self.dtype
+
+    if len(shape) != 2:
+      raise ValueError('Weights must be 2-dimensional.')
+
+    fan_in = shape[0]
+    fan_out = shape[1]
+
+    # Calculate number of non-zero weights
+    nnz = 1.
+    for d in shape:
+      nnz *= d
+    nnz *= (1. - self.sparsity)
+
+    limit = math.sqrt(6. / (nnz / fan_out + nnz / fan_in))
+
+    return tf.random_uniform(shape, -limit, limit, dtype, seed=self.seed)
+
+  def get_config(self):
+    return {
+        'seed': self.seed,
+        'dtype': self.dtype.name,
+    }
+
+
+#[Houxiang] Keep batch_norm_relu, dropblock, fixed_padding unchange
 def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
                     data_format='channels_first'):
   """Performs a batch normalization followed by a ReLU.
@@ -70,88 +161,6 @@ def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
     inputs = tf.nn.relu(inputs)
   return inputs
 
-
-def dropblock(net, is_training, keep_prob, dropblock_size,
-              data_format='channels_first'):
-  """DropBlock: a regularization method for convolutional neural networks.
-
-  DropBlock is a form of structured dropout, where units in a contiguous
-  region of a feature map are dropped together. DropBlock works better than
-  dropout on convolutional layers due to the fact that activation units in
-  convolutional layers are spatially correlated.
-  See https://arxiv.org/pdf/1810.12890.pdf for details.
-
-  Args:
-    net: `Tensor` input tensor.
-    is_training: `bool` for whether the model is training.
-    keep_prob: `float` or `Tensor` keep_prob parameter of DropBlock. "None"
-        means no DropBlock.
-    dropblock_size: `int` size of blocks to be dropped by DropBlock.
-    data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
-  Returns:
-      A version of input tensor with DropBlock applied.
-  Raises:
-      if width and height of the input tensor are not equal.
-  """
-
-  if not is_training or keep_prob is None:
-    return net
-
-  tf.logging.info('Applying DropBlock: dropblock_size {}, net.shape {}'.format(
-      dropblock_size, net.shape))
-
-  if data_format == 'channels_last':
-    _, width, height, _ = net.get_shape().as_list()
-  else:
-    _, _, width, height = net.get_shape().as_list()
-  if width != height:
-    raise ValueError('Input tensor with width!=height is not supported.')
-
-  dropblock_size = min(dropblock_size, width)
-  # seed_drop_rate is the gamma parameter of DropBlcok.
-  seed_drop_rate = (1.0 - keep_prob) * width**2 / dropblock_size**2 / (
-      width - dropblock_size + 1)**2
-
-  # Forces the block to be inside the feature map.
-  w_i, h_i = tf.meshgrid(tf.range(width), tf.range(width))
-  valid_block_center = tf.logical_and(
-      tf.logical_and(w_i >= int(dropblock_size // 2),
-                     w_i < width - (dropblock_size - 1) // 2),
-      tf.logical_and(h_i >= int(dropblock_size // 2),
-                     h_i < width - (dropblock_size - 1) // 2))
-
-  valid_block_center = tf.expand_dims(valid_block_center, 0)
-  valid_block_center = tf.expand_dims(
-      valid_block_center, -1 if data_format == 'channels_last' else 0)
-
-  randnoise = tf.random_uniform(net.shape, dtype=tf.float32)
-  block_pattern = (1 - tf.cast(valid_block_center, dtype=tf.float32) + tf.cast(
-      (1 - seed_drop_rate), dtype=tf.float32) + randnoise) >= 1
-  block_pattern = tf.cast(block_pattern, dtype=tf.float32)
-
-  if dropblock_size == width:
-    block_pattern = tf.reduce_min(
-        block_pattern,
-        axis=[1, 2] if data_format == 'channels_last' else [2, 3],
-        keepdims=True)
-  else:
-    if data_format == 'channels_last':
-      ksize = [1, dropblock_size, dropblock_size, 1]
-    else:
-      ksize = [1, 1, dropblock_size, dropblock_size]
-    block_pattern = -tf.nn.max_pool(
-        -block_pattern, ksize=ksize, strides=[1, 1, 1, 1], padding='SAME',
-        data_format='NHWC' if data_format == 'channels_last' else 'NCHW')
-
-  percent_ones = tf.cast(tf.reduce_sum((block_pattern)), tf.float32) / tf.cast(
-      tf.size(block_pattern), tf.float32)
-
-  net = net / tf.cast(percent_ones, net.dtype) * tf.cast(
-      block_pattern, net.dtype)
-  return net
-
-
 def fixed_padding(inputs, kernel_size, data_format='channels_first'):
   """Pads the input along the spatial dimensions independently of input size.
 
@@ -179,156 +188,228 @@ def fixed_padding(inputs, kernel_size, data_format='channels_first'):
 
   return padded_inputs
 
-
+# [Houxiang] Refine the codes from state_of_sparsity
 def conv2d_fixed_padding(inputs, filters, kernel_size, strides,
-                         data_format='channels_first'):
+                         pruning_method='baseline', init_method='baseline', data_format='channels_first',
+                         end_sparsity=0., weight_decay=0., clip_log_alpha=8.,log_alpha_threshold=3.,
+                         is_training=False, name=None):
   """Strided 2-D convolution with explicit padding.
 
   The padding is consistent and is based only on `kernel_size`, not on the
   dimensions of `inputs` (as opposed to using `tf.layers.conv2d` alone).
 
   Args:
-    inputs: `Tensor` of size `[batch, channels, height_in, width_in]`.
-    filters: `int` number of filters in the convolution.
-    kernel_size: `int` size of the kernel to be used in the convolution.
-    strides: `int` strides of the convolution.
-    data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
+    inputs:  Input tensor, float32 or bfloat16 of size [batch, channels, height, width].
+    filters: Int specifying number of filters for the first two convolutions.
+    kernel_size: Int designating size of kernel to be used in the convolution.
+    strides: Int specifying the stride. If stride >1, the input is downsampled.
+    pruning_method: String that specifies the pruning method used to identify which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
+    data_format: String that specifies either "channels_first" for [batch,
+      channels, height,width] or "channels_last" for [batch, height, width,
+      channels].
+    end_sparsity: Desired sparsity at the end of training. Necessary to initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method == 'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
+    is_training: boolean for whether model is in training or eval mode.
+    name: String that specifies name for model layer.
 
   Returns:
-    A `Tensor` of shape `[batch, filters, height_out, width_out]`.
+    The output activation tensor of size [batch, filters, height_out, width_out]
+
+  Raises:
+    ValueError: If the data_format provided is not a valid string.
   """
   if strides > 1:
-    inputs = fixed_padding(inputs, kernel_size, data_format=data_format)
+    inputs = fixed_padding(
+        inputs, kernel_size, data_format=data_format)
+  padding = 'SAME' if strides == 1 else 'VALID'
 
-  return tf.layers.conv2d(
-      inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
-      padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
-      kernel_initializer=tf.variance_scaling_initializer(),
-      data_format=data_format)
+  kernel_initializer = tf.variance_scaling_initializer()
+  if pruning_method == 'threshold' and init_method == 'sparse':
+    kernel_initializer = SparseConvVarianceScalingInitializer(end_sparsity)
+  if pruning_method != 'threshold' and init_method == 'sparse':
+    raise ValueError(
+        'Unsupported combination of flags, init_method must be baseline when '
+        'pruning_method is not threshold.')
 
+  # Initialize log-alpha s.t. the dropout rate is 10%
+  log_alpha_initializer = tf.random_normal_initializer(mean=2.197, stddev=0.01, dtype=tf.float32)
+  kernel_regularizer = tf.contrib.layers.l2_regularizer(weight_decay)
+
+  # Call sparse_conv2d which is defined in pruning_layers.py
+  return sparse_conv2d( x=inputs, units=filters, activation=None, kernel_size=[kernel_size, kernel_size],
+      use_bias=False, kernel_initializer=kernel_initializer, kernel_regularizer=kernel_regularizer,
+      bias_initializer=None, biases_regularizer=None,
+      sparsity_technique=pruning_method,
+      log_sigma2_initializer=tf.constant_initializer(-15., dtype=tf.float32),
+      log_alpha_initializer=log_alpha_initializer,
+      normalizer_fn=None, strides=[strides, strides], padding=padding, threshold=log_alpha_threshold,
+      clip_alpha=clip_log_alpha, data_format=data_format, is_training=is_training,name=name)
 
 def residual_block(inputs, filters, is_training, strides,
-                   use_projection=False, data_format='channels_first',
-                   dropblock_keep_prob=None, dropblock_size=None):
+                    use_projection=False, pruning_method='baseline', init_method='baseline',
+                    data_format='channels_first', end_sparsity=0., weight_decay=0.,
+                    clip_log_alpha=8., log_alpha_threshold=3., name=''):
   """Standard building block for residual networks with BN after convolutions.
 
   Args:
-    inputs: `Tensor` of size `[batch, channels, height, width]`.
-    filters: `int` number of filters for the first two convolutions. Note that
-        the third and final convolution will use 4 times as many filters.
-    is_training: `bool` for whether the model is in training.
-    strides: `int` block stride. If greater than 1, this block will ultimately
-        downsample the input.
-    use_projection: `bool` for whether this block should use a projection
-        shortcut (versus the default identity shortcut). This is usually `True`
-        for the first block of a block group, which may change the number of
-        filters and the resolution.
-    data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
-    dropblock_keep_prob: unused; needed to give method same signature as other
-      blocks
-    dropblock_size: unused; needed to give method same signature as other
-      blocks
+    inputs:  Input tensor, float32 or bfloat16 of size [batch, channels, height,
+      width].
+    filters: Int specifying number of filters for the first two convolutions.
+    is_training: Boolean specifying whether the model is training.
+    strides: Int specifying the stride. If stride >1, the input is downsampled.
+    use_projection: Boolean for whether the layer should use a projection
+      shortcut Often, use_projection=True for the first block of a block group.
+    pruning_method: String that specifies the pruning method used to identify
+      which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
+    data_format: String that specifies either "channels_first" for [batch,
+      channels, height,width] or "channels_last" for [batch, height, width,
+      channels].
+    end_sparsity: Desired sparsity at the end of training. Necessary to
+      initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method ==
+      'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
+    name: String that specifies name for model layer.
+
   Returns:
-    The output `Tensor` of the block.
+    The output activation tensor.
   """
-  del dropblock_keep_prob
-  del dropblock_size
+
   shortcut = inputs
   if use_projection:
     # Projection shortcut in first layer to match filters and strides
+    # Additional name here
+    end_point = 'residual_projection_%s' % name
     shortcut = conv2d_fixed_padding(
-        inputs=inputs, filters=filters, kernel_size=1, strides=strides,
-        data_format=data_format)
-    shortcut = batch_norm_relu(shortcut, is_training, relu=False,
-                               data_format=data_format)
+      inputs=inputs, filters=filters, kernel_size=1, strides=strides,
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+    shortcut = batch_norm_relu(
+        shortcut, is_training, relu=False, data_format=data_format)
 
+  end_point = 'residual_1_%s' % name
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
-      data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+  inputs = batch_norm_relu(
+      inputs, is_training, data_format=data_format)
 
+  end_point = 'residual_2_%s' % name
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=1,
-      data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
-                           data_format=data_format)
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+  inputs = batch_norm_relu(
+      inputs, is_training, relu=False, init_zero=True, data_format=data_format)
 
   return tf.nn.relu(inputs + shortcut)
 
-
+#[Houxiang] Latest version has dropblock in the bottleneck_block definition, we drop it here
 def bottleneck_block(inputs, filters, is_training, strides,
-                     use_projection=False, data_format='channels_first',
-                     dropblock_keep_prob=None, dropblock_size=None):
+                      use_projection=False, pruning_method='baseline', init_method='baseline',
+                      data_format='channels_first', end_sparsity=0., weight_decay=0.,
+                      clip_log_alpha=8., log_alpha_threshold=3., name=None):
   """Bottleneck block variant for residual networks with BN after convolutions.
 
   Args:
-    inputs: `Tensor` of size `[batch, channels, height, width]`.
-    filters: `int` number of filters for the first two convolutions. Note that
-        the third and final convolution will use 4 times as many filters.
-    is_training: `bool` for whether the model is in training.
-    strides: `int` block stride. If greater than 1, this block will ultimately
-        downsample the input.
-    use_projection: `bool` for whether this block should use a projection
-        shortcut (versus the default identity shortcut). This is usually `True`
-        for the first block of a block group, which may change the number of
-        filters and the resolution.
-    data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
-    dropblock_keep_prob: `float` or `Tensor` keep_prob parameter of DropBlock.
-        "None" means no DropBlock.
-    dropblock_size: `int` size parameter of DropBlock. Will not be used if
-        dropblock_keep_prob is "None".
+    inputs: Input tensor, float32 or bfloat16 of size [batch, channels, height,
+      width].
+    filters: Int specifying number of filters for the first two convolutions.
+    is_training: Boolean specifying whether the model is training.
+    strides: Int specifying the stride. If stride >1, the input is downsampled.
+    use_projection: Boolean for whether the layer should use a projection
+      shortcut Often, use_projection=True for the first block of a block group.
+    pruning_method: String that specifies the pruning method used to identify
+      which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
+    data_format: String that specifies either "channels_first" for [batch,
+      channels, height,width] or "channels_last" for [batch, height, width,
+      channels].
+    end_sparsity: Desired sparsity at the end of training. Necessary to
+      initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method ==
+      'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
+    name: String that specifies name for model layer.
 
   Returns:
-    The output `Tensor` of the block.
+    The output activation tensor.
   """
+
   shortcut = inputs
+
   if use_projection:
     # Projection shortcut only in first block within a group. Bottleneck blocks
     # end with 4 times the number of filters.
-    filters_out = 4 * filters
+    # Useless variable
+    # filters_out = 4 * filters
+    end_point = 'bottleneck_projection_%s' % name
     shortcut = conv2d_fixed_padding(
-        inputs=inputs, filters=filters_out, kernel_size=1, strides=strides,
-        data_format=data_format)
-    shortcut = batch_norm_relu(shortcut, is_training, relu=False,
-                               data_format=data_format)
-  shortcut = dropblock(
-      shortcut, is_training=is_training, data_format=data_format,
-      keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
+      inputs=inputs, filters=filters, kernel_size=1, strides=strides,
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+    shortcut = batch_norm_relu(
+        shortcut, is_training, relu=False, data_format=data_format)
 
+  end_point = 'bottleneck_1_%s' % name
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=1, strides=1,
-      data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
-  inputs = dropblock(
-      inputs, is_training=is_training, data_format=data_format,
-      keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+  inputs = batch_norm_relu(
+      inputs, is_training, data_format=data_format)
 
+  end_point = 'bottleneck_2_%s' % name
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
-      data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
-  inputs = dropblock(
-      inputs, is_training=is_training, data_format=data_format,
-      keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+  inputs = batch_norm_relu(
+      inputs, is_training, data_format=data_format)
 
+  end_point = 'bottleneck_3_%s' % name
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
-      data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
-                           data_format=data_format)
-  inputs = dropblock(
-      inputs, is_training=is_training, data_format=data_format,
-      keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
+      pruning_method=pruning_method, init_method=init_method,
+      data_format=data_format, end_sparsity=end_sparsity,
+      weight_decay=weight_decay, clip_log_alpha=clip_log_alpha,
+      log_alpha_threshold=log_alpha_threshold, is_training=is_training, name=end_point)
+  inputs = batch_norm_relu(
+      inputs, is_training, relu=False, init_zero=True, data_format=data_format)
 
   return tf.nn.relu(inputs + shortcut)
 
-
 def block_group(inputs, filters, block_fn, blocks, strides, is_training, name,
-                data_format='channels_first', dropblock_keep_prob=None,
-                dropblock_size=None):
+                pruning_method='baseline', init_method='baseline', data_format='channels_first',
+                end_sparsity=0., weight_decay=0., clip_log_alpha=8., log_alpha_threshold=3.):
   """Creates one group of blocks for the ResNet model.
 
   Args:
@@ -337,123 +418,263 @@ def block_group(inputs, filters, block_fn, blocks, strides, is_training, name,
     block_fn: `function` for the block to use within the model
     blocks: `int` number of blocks contained in the layer.
     strides: `int` stride to use for the first convolution of the layer. If
-        greater than 1, this layer will downsample the input.
+      greater than 1, this layer will downsample the input.
     is_training: `bool` for whether the model is training.
-    name: `str`name for the Tensor output of the block layer.
+    name: String specifying the Tensor output of the block layer.
+    pruning_method: String that specifies the pruning method used to identify
+      which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
     data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
-    dropblock_keep_prob: `float` or `Tensor` keep_prob parameter of DropBlock.
-        "None" means no DropBlock.
-    dropblock_size: `int` size parameter of DropBlock. Will not be used if
-        dropblock_keep_prob is "None".
+      width]` or "channels_last for `[batch, height, width, channels]`.
+    end_sparsity: Desired sparsity at the end of training. Necessary to
+      initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method ==
+      'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
 
   Returns:
     The output `Tensor` of the block layer.
   """
-  # Only the first block per block_group uses projection shortcut and strides.
-  inputs = block_fn(inputs, filters, is_training, strides,
-                    use_projection=True, data_format=data_format,
-                    dropblock_keep_prob=dropblock_keep_prob,
-                    dropblock_size=dropblock_size)
 
-  for _ in range(1, blocks):
-    inputs = block_fn(inputs, filters, is_training, 1,
-                      data_format=data_format,
-                      dropblock_keep_prob=dropblock_keep_prob,
-                      dropblock_size=dropblock_size)
+  with tf.name_scope(name):
+    end_point = 'block_group_projection_%s' % name
+    # Only the first block per block_group uses projection shortcut and strides.
+    inputs = block_fn(inputs, filters, is_training, strides,
+        use_projection=True,data_format=data_format,
+        pruning_method=pruning_method, init_method=init_method,
+        end_sparsity=end_sparsity, weight_decay=weight_decay,
+        clip_log_alpha=clip_log_alpha, log_alpha_threshold=log_alpha_threshold, name=end_point)
+
+    for n in range(1, blocks):
+      with tf.name_scope('block_group_%d' % n):
+        end_point = '%s_%d_1' % (name, n)
+        inputs = block_fn(inputs, filters, is_training, 1,
+            pruning_method=pruning_method, init_method=init_method,
+            data_format=data_format,
+            end_sparsity=end_sparsity, weight_decay=weight_decay,
+            clip_log_alpha=clip_log_alpha, log_alpha_threshold=log_alpha_threshold, name=end_point)
 
   return tf.identity(inputs, name)
 
-
-def resnet_v1_generator(block_fn, layers, num_classes,
-                        data_format='channels_first', dropblock_keep_probs=None,
-                        dropblock_size=None):
+def resnet_v1_generator(block_fn, num_blocks, num_classes,
+                        pruning_method='baseline', init_method='baseline',
+                        width=1.,
+                        prune_first_layer=True, prune_last_layer=True,
+                        data_format='channels_first',
+                        end_sparsity=0., weight_decay=0.,
+                        clip_log_alpha=8., log_alpha_threshold=3.,name=None):
   """Generator for ResNet v1 models.
 
   Args:
-    block_fn: `function` for the block to use within the model. Either
-        `residual_block` or `bottleneck_block`.
-    layers: list of 4 `int`s denoting the number of blocks to include in each
-      of the 4 block groups. Each group consists of blocks that take inputs of
-      the same resolution.
-    num_classes: `int` number of possible classes for image classification.
-    data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
-    dropblock_keep_probs: `list` of 4 elements denoting keep_prob of DropBlock
-      for each block group. None indicates no DropBlock for the corresponding
-      block group.
-    dropblock_size: `int`: size parameter of DropBlock.
+    block_fn: String that defines whether to use a `residual_block` or
+      `bottleneck_block`.
+    num_blocks: list of Ints that denotes number of blocks to include in each
+      block group. Each group consists of blocks that take inputs of the same
+      resolution.
+    num_classes: Int number of possible classes for image classification.
+    pruning_method: String that specifies the pruning method used to identify
+      which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
+    width: Float that scales the number of filters in each layer.
+    prune_first_layer: Whether or not to prune the first layer.
+    prune_last_layer: Whether or not to prune the last layer.
+    data_format: String either "channels_first" for `[batch, channels, height,
+      width]` or "channels_last for `[batch, height, width, channels]`.
+    end_sparsity: Desired sparsity at the end of training. Necessary to
+      initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method ==
+      'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
+    name: String that specifies name for model layer.
 
   Returns:
     Model `function` that takes in `inputs` and `is_training` and returns the
     output `Tensor` of the ResNet model.
-
-  Raises:
-    if dropblock_keep_probs is not 'None' or a list with len 4.
   """
-  if dropblock_keep_probs is None:
-    dropblock_keep_probs = [None] * 4
-  if not isinstance(dropblock_keep_probs,
-                    list) or len(dropblock_keep_probs) != 4:
-    raise ValueError('dropblock_keep_probs is not valid:', dropblock_keep_probs)
 
   def model(inputs, is_training):
     """Creation of the model graph."""
-    inputs = conv2d_fixed_padding(
-        inputs=inputs, filters=64, kernel_size=7, strides=2,
-        data_format=data_format)
-    inputs = tf.identity(inputs, 'initial_conv')
-    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+    with tf.variable_scope(name, 'resnet_model'):
+      inputs = conv2d_fixed_padding(
+          inputs=inputs, filters=int(64 * width),
+          kernel_size=7, strides=2,
+          pruning_method=pruning_method if prune_first_layer else 'baseline',
+          init_method=init_method if prune_first_layer else 'baseline',
+          is_training=is_training,
+          data_format=data_format,
+          end_sparsity=end_sparsity,
+          weight_decay=weight_decay,
+          clip_log_alpha=clip_log_alpha,
+          log_alpha_threshold=log_alpha_threshold,
+          name='initial_conv')
 
-    inputs = tf.layers.max_pooling2d(
-        inputs=inputs, pool_size=3, strides=2, padding='SAME',
-        data_format=data_format)
-    inputs = tf.identity(inputs, 'initial_max_pool')
+      inputs = tf.identity(inputs, 'initial_conv')
+      inputs = batch_norm_relu(
+          inputs, is_training, data_format=data_format)
 
-    inputs = block_group(
-        inputs=inputs, filters=64, block_fn=block_fn, blocks=layers[0],
-        strides=1, is_training=is_training, name='block_group1',
-        data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[0],
-        dropblock_size=dropblock_size)
-    inputs = block_group(
-        inputs=inputs, filters=128, block_fn=block_fn, blocks=layers[1],
-        strides=2, is_training=is_training, name='block_group2',
-        data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[1],
-        dropblock_size=dropblock_size)
-    inputs = block_group(
-        inputs=inputs, filters=256, block_fn=block_fn, blocks=layers[2],
-        strides=2, is_training=is_training, name='block_group3',
-        data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[2],
-        dropblock_size=dropblock_size)
-    inputs = block_group(
-        inputs=inputs, filters=512, block_fn=block_fn, blocks=layers[3],
-        strides=2, is_training=is_training, name='block_group4',
-        data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[3],
-        dropblock_size=dropblock_size)
+      inputs = tf.layers.max_pooling2d(
+          inputs=inputs,
+          pool_size=3,
+          strides=2,
+          padding='SAME',
+          data_format=data_format,
+          name='initial_max_pool')
+      inputs = tf.identity(inputs, 'initial_max_pool')
 
-    # The activation is 7x7 so this is a global average pool.
-    # TODO(huangyp): reduce_mean will be faster.
-    pool_size = (inputs.shape[1], inputs.shape[2])
-    inputs = tf.layers.average_pooling2d(
-        inputs=inputs, pool_size=pool_size, strides=1, padding='VALID',
-        data_format=data_format)
-    inputs = tf.identity(inputs, 'final_avg_pool')
-    inputs = tf.reshape(
-        inputs, [-1, 2048 if block_fn is bottleneck_block else 512])
-    inputs = tf.layers.dense(
-        inputs=inputs,
-        units=num_classes,
-        kernel_initializer=tf.random_normal_initializer(stddev=.01))
-    inputs = tf.identity(inputs, 'final_dense')
+      # Block groups
+      inputs = block_group(
+          inputs=inputs,
+          filters=int(64 * width),
+          block_fn=block_fn,
+          blocks=num_blocks[0],
+          strides=1,
+          is_training=is_training,
+          name='block_group1',
+          pruning_method=pruning_method,
+          init_method=init_method,
+          data_format=data_format,
+          end_sparsity=end_sparsity,
+          weight_decay=weight_decay,
+          clip_log_alpha=clip_log_alpha,
+          log_alpha_threshold=log_alpha_threshold)
+      inputs = block_group(
+          inputs=inputs,
+          filters=int(128 * width),
+          block_fn=block_fn,
+          blocks=num_blocks[1],
+          strides=2,
+          is_training=is_training,
+          name='block_group2',
+          pruning_method=pruning_method,
+          init_method=init_method,
+          data_format=data_format,
+          end_sparsity=end_sparsity,
+          weight_decay=weight_decay,
+          clip_log_alpha=clip_log_alpha,
+          log_alpha_threshold=log_alpha_threshold)
+      inputs = block_group(
+          inputs=inputs,
+          filters=int(256 * width),
+          block_fn=block_fn,
+          blocks=num_blocks[2],
+          strides=2,
+          is_training=is_training,
+          name='block_group3',
+          pruning_method=pruning_method,
+          init_method=init_method,
+          data_format=data_format,
+          end_sparsity=end_sparsity,
+          weight_decay=weight_decay,
+          clip_log_alpha=clip_log_alpha,
+          log_alpha_threshold=log_alpha_threshold)
+      inputs = block_group(
+          inputs=inputs,
+          filters=int(512 * width),
+          block_fn=block_fn,
+          blocks=num_blocks[3],
+          strides=2,
+          is_training=is_training,
+          name='block_group4',
+          pruning_method=pruning_method,
+          init_method=init_method,
+          data_format=data_format,
+          end_sparsity=end_sparsity,
+          weight_decay=weight_decay,
+          clip_log_alpha=clip_log_alpha,
+          log_alpha_threshold=log_alpha_threshold)
+
+      pool_size = (inputs.shape[1], inputs.shape[2])
+      inputs = tf.layers.average_pooling2d(
+          inputs=inputs,
+          pool_size=pool_size,
+          strides=1,
+          padding='VALID',
+          data_format=data_format,
+          name='final_avg_pool')
+      inputs = tf.identity(inputs, 'final_avg_pool')
+
+      multiplier = 4 if block_fn is bottleneck_block_ else 1
+      fc_units = multiplier * int(512 * width)
+
+      inputs = tf.reshape(inputs, [-1, fc_units])
+
+      kernel_initializer = tf.random_normal_initializer(stddev=.01)
+      if (pruning_method == 'threshold' and init_method == 'sparse' and
+          prune_last_layer):
+        kernel_initializer = SparseFCVarianceScalingInitializer(end_sparsity)
+      if pruning_method != 'threshold' and init_method == 'sparse':
+        raise ValueError(
+            'Unsupported combination of flags, init_method must be baseline '
+            'when pruning_method is not threshold.')
+
+      # Initialize log-alpha s.t. the dropout rate is 10%
+      log_alpha_initializer = tf.random_normal_initializer(mean=2.197, stddev=0.01, dtype=tf.float32)
+      kernel_regularizer = tf.contrib.layers.l2_regularizer(weight_decay)
+
+      # Instead of original tf.layer.dense(), use sparseFC
+      inputs = sparse_fully_connected(
+          x=inputs,
+          units=num_classes,
+          sparsity_technique=pruning_method if prune_last_layer else 'baseline',
+          kernel_initializer=kernel_initializer,
+          kernel_regularizer=kernel_regularizer,
+          log_sigma2_initializer=tf.constant_initializer(
+              -15., dtype=tf.float32),
+          log_alpha_initializer=log_alpha_initializer,
+          clip_alpha=clip_log_alpha,
+          threshold=log_alpha_threshold,
+          is_training=is_training,
+          name='final_dense')
+
+      inputs = tf.identity(inputs, 'final_dense')
+    #aligned with 'with scope' statement
     return inputs
 
   model.default_image_size = 224
   return model
 
+def resnet_v1_(resnet_depth, num_classes, pruning_method='baseline', init_method='baseline',
+               width=1.,
+               prune_first_layer=True,
+               prune_last_layer=True,
+               data_format='channels_first',
+               end_sparsity=0., weight_decay=0.,
+               clip_log_alpha=8., log_alpha_threshold=3.):
+  """Returns the ResNet model for a given size and number of output classes.
 
-def resnet_v1(resnet_depth, num_classes, data_format='channels_first',
-              dropblock_keep_probs=None, dropblock_size=None):
-  """Returns the ResNet model for a given size and number of output classes."""
+  Args:
+    resnet_depth: Int number of blocks in the architecture.
+    num_classes: Int number of possible classes for image classification.
+    pruning_method: String that specifies the pruning method used to identify
+      which weights to remove.
+    init_method: ('baseline', 'sparse') Whether to use standard initialization
+      or initialization that takes into the existing sparsity of the layer.
+      'sparse' only makes sense when combined with pruning_method == 'scratch'.
+    width: Float multiplier of the number of filters in each layer.
+    prune_first_layer: Whether or not to prune the first layer.
+    prune_last_layer: Whether or not to prune the last layer.
+    data_format: String specifying either "channels_first" for `[batch,
+      channels, height, width]` or "channels_last for `[batch, height, width,
+      channels]`.
+    end_sparsity: Desired sparsity at the end of training. Necessary to
+      initialize an already sparse network.
+    weight_decay: Weight for the l2 regularization loss.
+    clip_log_alpha: Value at which to clip log_alpha (if pruning_method ==
+      'variational_dropout') during training.
+    log_alpha_threshold: Threshold at which to zero weights based on log_alpha
+      (if pruning_method == 'variational_dropout') during eval.
+
+  Raises:
+    ValueError: If the resnet_depth int is not in the model_params dictionary.
+  """
   model_params = {
       18: {'block': residual_block, 'layers': [2, 2, 2, 2]},
       34: {'block': residual_block, 'layers': [3, 4, 6, 3]},
@@ -468,6 +689,6 @@ def resnet_v1(resnet_depth, num_classes, data_format='channels_first',
 
   params = model_params[resnet_depth]
   return resnet_v1_generator(
-      params['block'], params['layers'], num_classes,
-      dropblock_keep_probs=dropblock_keep_probs, dropblock_size=dropblock_size,
-      data_format=data_format)
+      params['block'], params['layers'], num_classes, pruning_method,
+      init_method, width, prune_first_layer, prune_last_layer, data_format,
+      end_sparsity, weight_decay, clip_log_alpha, log_alpha_threshold)
