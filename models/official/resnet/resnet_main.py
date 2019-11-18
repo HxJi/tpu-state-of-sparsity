@@ -43,6 +43,8 @@ from tensorflow.contrib.training.python.training import evaluation
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.estimator import estimator
 
+from tensorflow.contrib.model_pruning.python import pruning
+
 common_tpu_flags.define_common_tpu_flags()
 common_hparams_flags.define_common_hparams_flags()
 
@@ -386,6 +388,38 @@ def resnet_model_fn(features, labels, mode, params):
     with tf.control_dependencies(update_ops):
       train_op = optimizer.minimize(loss, global_step)
 
+    hparams_string = ('begin_pruning_step={0},'
+                      'sparsity_function_begin_step={0},'
+                      'end_pruning_step={1},'
+                      'sparsity_function_end_step={1},'
+                      'target_sparsity={2},'
+                      'pruning_frequency={3},'
+                      'threshold_decay=0,'
+                      'use_tpu={4}'.format(
+                          '40000',
+                          '76000',
+                          '0.8',
+                          '2000',
+                          'True',
+                      ))
+
+    # Parse pruning hyperparameters
+    pruning_hparams = pruning.get_pruning_hparams().parse(hparams_string)
+
+    # Create a pruning object using the pruning hyperparameters
+    pruning_obj = pruning.Pruning(pruning_hparams, global_step=global_step)
+
+    # We override the train op to also update the mask.
+    with tf.control_dependencies([train_op]):
+      train_op = pruning_obj.conditional_mask_update_op()
+
+    # masks = pruning.get_masks()
+
+    # metrics = {}
+    # for mask in masks:
+    #   metrics['pruning/{}/sparsity'.format(
+    #       mask.op.name)] = tf.nn.zero_fraction(mask)
+
     if not params['skip_host_call']:
       def host_call_fn(gs, loss, lr, ce):
         """Training host call. Creates scalar summaries for training metrics.
@@ -533,6 +567,7 @@ def _select_tables_from_flags():
 
 
 def main(unused_argv):
+
   params = params_dict.ParamsDict(
       resnet_config.RESNET_CFG, resnet_config.RESNET_RESTRICTIONS)
   params = params_dict.override_params_dict(
@@ -558,6 +593,7 @@ def main(unused_argv):
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_steps=save_checkpoints_steps,
+      keep_checkpoint_max=100,
       log_step_count_steps=FLAGS.log_step_count_steps,
       session_config=tf.ConfigProto(
           graph_options=tf.GraphOptions(
@@ -611,7 +647,7 @@ def main(unused_argv):
             image_size=params.image_size,
             num_parallel_calls=params.num_parallel_calls,
             include_background_label=(params.num_label_classes == 1001),
-            use_bfloat16=use_bfloat16) for is_training in [True, False]
+            use_bfloat16=False) for is_training in [True, False]
     ]
 
   steps_per_epoch = params.num_train_images // params.train_batch_size

@@ -25,9 +25,13 @@ from __future__ import print_function
 
 import tensorflow as tf
 
+from tensorflow.contrib.model_pruning.python.layers import layers as prunelayers
+from tensorflow.contrib.model_pruning.python import pruning
+
 BATCH_NORM_DECAY = 0.9
 BATCH_NORM_EPSILON = 1e-5
 
+conv_counter = 0
 
 def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
                     data_format='channels_first'):
@@ -201,11 +205,21 @@ def conv2d_fixed_padding(inputs, filters, kernel_size, strides,
   if strides > 1:
     inputs = fixed_padding(inputs, kernel_size, data_format=data_format)
 
-  return tf.layers.conv2d(
-      inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
-      padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
-      kernel_initializer=tf.variance_scaling_initializer(),
-      data_format=data_format)
+  # return tf.layers.conv2d(
+  #     inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
+  #     padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
+  #     kernel_initializer=tf.variance_scaling_initializer(),
+  #     data_format=data_format)
+
+  global conv_counter
+  conv_counter += 1
+
+  with tf.variable_scope("conv-%d" % conv_counter) as sc:
+    return prunelayers.masked_conv2d(
+        inputs=inputs, num_outputs=filters, kernel_size=kernel_size, stride=strides,
+        padding=('SAME' if strides == 1 else 'VALID'),
+        weights_initializer=tf.variance_scaling_initializer(),
+        biases_initializer=None, scope=sc)
 
 
 def residual_block(inputs, filters, is_training, strides,
@@ -399,6 +413,10 @@ def resnet_v1_generator(block_fn, layers, num_classes,
 
   def model(inputs, is_training):
     """Creation of the model graph."""
+    
+    global conv_counter
+    conv_counter = 0
+
     inputs = conv2d_fixed_padding(
         inputs=inputs, filters=64, kernel_size=7, strides=2,
         data_format=data_format)
@@ -440,10 +458,16 @@ def resnet_v1_generator(block_fn, layers, num_classes,
     inputs = tf.identity(inputs, 'final_avg_pool')
     inputs = tf.reshape(
         inputs, [-1, 2048 if block_fn is bottleneck_block else 512])
-    inputs = tf.layers.dense(
-        inputs=inputs,
-        units=num_classes,
-        kernel_initializer=tf.random_normal_initializer(stddev=.01))
+    # inputs = tf.layers.dense(
+    #     inputs=inputs,
+    #     units=num_classes,
+    #     kernel_initializer=tf.random_normal_initializer(stddev=.01))
+    with tf.variable_scope("final_dense") as sc:
+      inputs = prunelayers.masked_fully_connected(
+          inputs=inputs,
+          num_outputs=num_classes,
+          weights_initializer=tf.random_normal_initializer(stddev=.01),
+          scope=sc)
     inputs = tf.identity(inputs, 'final_dense')
     return inputs
 
