@@ -315,6 +315,9 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=1, strides=1,
       data_format=data_format)
+  
+  # print("input.shape.1",inputs.get_shape())
+
   inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
@@ -323,6 +326,9 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
+  
+  # print("input.shape.2",inputs.get_shape())
+
   inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
@@ -331,6 +337,9 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
       data_format=data_format)
+
+  # print("input.shape.3",inputs.get_shape())
+
   inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
                            data_format=data_format)
   inputs = dropblock(
