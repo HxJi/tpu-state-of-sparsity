@@ -117,8 +117,8 @@ l0_sparsity = functools.partial(
 #suffixs choose read mask or weight
 pruning_sparsity = functools.partial(
     get_sparsity,
-    # suffixes=["mask"],
-    suffixes=["weights"],
+    suffixes=["mask"],
+    #suffixes=["weights"],
     mask_fn=lambda x: x)
 
 

@@ -13,5 +13,5 @@
 # export PYTHONPATH="$PYTHONPATH:/path/to/models"
 # python resnet_main.py --mode=eval --num_eval_images=64 --eval_batch_size=64 --data_dir=/scratch/hj14/tf_record_latest --model_dir=/scratch/hj14/tpu_checkpoints/ckpt-102epoch/model.ckpt-32526/model.ckpt-32526 --use_tpu=false --precision=float32  2>&1 | tee tpu.logpython resnet_main.py --mode=eval --num_eval_images=64 --eval_batch_size=64 --data_dir=/scratch/hj14/tf_record_latest --model_dir=/scratch/hj14/tpu_checkpoints/ckpt-102epoch/model.ckpt-32526/model.ckpt-32526 --use_tpu=false --precision=float32
 
-sh act_sparsity_script.sh
 sh mask_sparsity_script.sh
+sh act_sparsity_script.sh

@@ -437,7 +437,12 @@ def resnet_v1_generator(block_fn, layers, num_classes,
         inputs=inputs, filters=64, kernel_size=7, strides=2,
         data_format=data_format)
     inputs = tf.identity(inputs, 'initial_conv')
-    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+    # measure sparsity for first conv layer
+    sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+    print_out = tf.Print(sparsity, [sparsity])
+
+    with tf.control_dependencies([print_out]):
+      inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
 
     inputs = tf.layers.max_pooling2d(
         inputs=inputs, pool_size=3, strides=2, padding='SAME',
