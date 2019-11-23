@@ -34,7 +34,7 @@ BATCH_NORM_EPSILON = 1e-5
 conv_counter = 0
 
 def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
-                    data_format='channels_first', sparsity=None):
+                    data_format='channels_first'):
   """Performs a batch normalization followed by a ReLU.
 
   Args:
@@ -315,10 +315,13 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=1, strides=1,
       data_format=data_format)
-  
-  # print("input.shape.1",inputs.get_shape())
 
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  # sparsity = 1-(tf.size(tf.count_nonzero(inputs))/tf.size(inputs))
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
+
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -327,10 +330,11 @@ def bottleneck_block(inputs, filters, is_training, strides,
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
 
-  sparsity = 1-(tf.size(tf.count_nonzero(inputs))/tf.size(inputs))
-  print_out = tf.Print(sparsity, [sparsity],"print sparsity value")
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
 
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format,sparsity=print_out)
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -339,10 +343,12 @@ def bottleneck_block(inputs, filters, is_training, strides,
       inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
       data_format=data_format)
 
-  # print("input.shape.3",inputs.get_shape())
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
 
-  inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
-                           data_format=data_format)
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
+                            data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
