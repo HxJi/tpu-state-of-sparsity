@@ -88,18 +88,13 @@ def get_sparsity(checkpoint, suffixes, mask_fn):
   tensor_names.sort(key=natural_keys)
   nnz = 0.0
   total = 0.0
-  a = 0
   for s in tensor_names:
-    print(s)
+    # print(s)
     tensor = ckpt_reader.get_tensor(s)
     mask = mask_fn(tensor)
-    # print(s)
-    # print(mask)
     print(1-(np.count_nonzero(mask)/mask.size))
     nnz += np.count_nonzero(mask)
     total += mask.size
-    # a += 1 
-    # print(a)
   # print("{} global sparsity = {}%".format(checkpoint, 100 * (1 - nnz / total)))
 
 

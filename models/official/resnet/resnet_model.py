@@ -24,7 +24,7 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
+import numpy as np
 from tensorflow.contrib.model_pruning.python.layers import layers as prunelayers
 from tensorflow.contrib.model_pruning.python import pruning
 
@@ -34,7 +34,7 @@ BATCH_NORM_EPSILON = 1e-5
 conv_counter = 0
 
 def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
-                    data_format='channels_first'):
+                    data_format='channels_first', sparsity=None):
   """Performs a batch normalization followed by a ReLU.
 
   Args:
@@ -326,10 +326,11 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  
-  # print("input.shape.2",inputs.get_shape())
 
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  sparsity = 1-(tf.size(tf.count_nonzero(inputs))/tf.size(inputs))
+  print_out = tf.Print(sparsity, [sparsity],"print sparsity value")
+
+  inputs = batch_norm_relu(inputs, is_training, data_format=data_format,sparsity=print_out)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)

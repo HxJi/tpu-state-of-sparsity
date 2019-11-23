@@ -660,36 +660,36 @@ def main(unused_argv):
         FLAGS.model_dir, timeout=FLAGS.eval_timeout):
       tf.logging.info('Starting to evaluate.')
       try:
-      start_timestamp = time.time()  # This time will include compilation time
+        start_timestamp = time.time()  # This time will include compilation time
 
-      eval_results = resnet_classifier.evaluate(
-          input_fn=imagenet_eval.input_fn,
-          steps=eval_steps,
-          checkpoint_path=ckpt)
-      # print(resnet_classifier.get_variable_names())
-      # for i in range(1,54):
-      #   print(i)
-      #   a='conv-'+str(i)+'/mask'
-      #   b=resnet_classifier.get_variable_value(a)
-      #   spar = 0
-      #   for i in range (b.shape[0]):
-      #     for j in range (b.shape[1]):
-      #       for k in range (b.shape[2]):
-      #         for m in range (b.shape[3]):
-      #           if b[i][j][k][m] == 0:
-      #             spar = spar + 1
-      #   print(spar/b.size)
+        eval_results = resnet_classifier.evaluate(
+            input_fn=imagenet_eval.input_fn,
+            steps=eval_steps,
+            checkpoint_path=ckpt)
+        # print(resnet_classifier.get_variable_names())
+        # for i in range(1,54):
+        #   print(i)
+        #   a='conv-'+str(i)+'/mask'
+        #   b=resnet_classifier.get_variable_value(a)
+        #   spar = 0
+        #   for i in range (b.shape[0]):
+        #     for j in range (b.shape[1]):
+        #       for k in range (b.shape[2]):
+        #         for m in range (b.shape[3]):
+        #           if b[i][j][k][m] == 0:
+        #             spar = spar + 1
+        #   print(spar/b.size)
 
-      elapsed_time = int(time.time() - start_timestamp)
-      tf.logging.info('Eval results: %s. Elapsed seconds: %d',
-                      eval_results, elapsed_time)
+        elapsed_time = int(time.time() - start_timestamp)
+        tf.logging.info('Eval results: %s. Elapsed seconds: %d',
+                        eval_results, elapsed_time)
 
-      # Terminate eval job when final checkpoint is reached
-      current_step = int(os.path.basename(ckpt).split('-')[1])
-      if current_step >= params.train_steps:
-        tf.logging.info(
-            'Evaluation finished after training step %d', current_step)
-        break
+        # Terminate eval job when final checkpoint is reached
+        current_step = int(os.path.basename(ckpt).split('-')[1])
+        if current_step >= params.train_steps:
+          tf.logging.info(
+              'Evaluation finished after training step %d', current_step)
+          break
 
       except tf.errors.NotFoundError:
         # Since the coordinator is on a different job than the TPU worker,
