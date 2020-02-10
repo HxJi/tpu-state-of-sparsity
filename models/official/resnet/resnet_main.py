@@ -203,6 +203,11 @@ flags.DEFINE_multi_integer(
     'inference_batch_sizes', [8],
     'Known inference batch sizes used to warm up for each core.')
 
+# Pruning or not
+flags.DEFINE_bool(
+    'pruning', False,
+    'prune the resnet targeting on sparsity or normal resnet'
+)
 
 # The input tensor is in the range of [0, 255], we need to scale them to the
 # range of [0, 1]
@@ -388,30 +393,31 @@ def resnet_model_fn(features, labels, mode, params):
     with tf.control_dependencies(update_ops):
       train_op = optimizer.minimize(loss, global_step)
 
-    hparams_string = ('begin_pruning_step={0},'
-                      'sparsity_function_begin_step={0},'
-                      'end_pruning_step={1},'
-                      'sparsity_function_end_step={1},'
-                      'target_sparsity={2},'
-                      'pruning_frequency={3},'
-                      'threshold_decay=0,'
-                      'use_tpu={4}'.format(
-                          '40000',
-                          '76000',
-                          '0.8',
-                          '2000',
-                          'True',
-                      ))
+    if params['pruning']:
+      hparams_string = ('begin_pruning_step={0},'
+                        'sparsity_function_begin_step={0},'
+                        'end_pruning_step={1},'
+                        'sparsity_function_end_step={1},'
+                        'target_sparsity={2},'
+                        'pruning_frequency={3},'
+                        'threshold_decay=0,'
+                        'use_tpu={4}'.format(
+                            '40000',
+                            '76000',
+                            '0.8',
+                            '2000',
+                            'True',
+                        ))
 
-    # Parse pruning hyperparameters
-    pruning_hparams = pruning.get_pruning_hparams().parse(hparams_string)
+      # Parse pruning hyperparameters
+      pruning_hparams = pruning.get_pruning_hparams().parse(hparams_string)
 
-    # Create a pruning object using the pruning hyperparameters
-    pruning_obj = pruning.Pruning(pruning_hparams, global_step=global_step)
+      # Create a pruning object using the pruning hyperparameters
+      pruning_obj = pruning.Pruning(pruning_hparams, global_step=global_step)
 
-    # We override the train op to also update the mask.
-    with tf.control_dependencies([train_op]):
-      train_op = pruning_obj.conditional_mask_update_op()
+      # We override the train op to also update the mask.
+      with tf.control_dependencies([train_op]):
+        train_op = pruning_obj.conditional_mask_update_op()
 
     # masks = pruning.get_masks()
 
