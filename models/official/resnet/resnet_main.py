@@ -45,6 +45,9 @@ from tensorflow.python.estimator import estimator
 
 from tensorflow.contrib.model_pruning.python import pruning
 
+# import tensorflow.contrib.eager as tfe
+# tfe.enable_eager_execution()
+
 common_tpu_flags.define_common_tpu_flags()
 common_hparams_flags.define_common_hparams_flags()
 
@@ -662,16 +665,18 @@ def main(unused_argv):
   if FLAGS.mode == 'eval':
 
     # Run evaluation when there's a new checkpoint
-    for ckpt in evaluation.checkpoints_iterator(
-        FLAGS.model_dir, timeout=FLAGS.eval_timeout):
-      tf.logging.info('Starting to evaluate.')
-      try:
+    # for ckpt in evaluation.checkpoints_iterator(
+    #     FLAGS.model_dir, timeout=FLAGS.eval_timeout):
+    # for ckpt in FLAGS.model_dir:
+    tf.logging.info('Starting to evaluate.')
+    try:
       start_timestamp = time.time()  # This time will include compilation time
 
       eval_results = resnet_classifier.evaluate(
           input_fn=imagenet_eval.input_fn,
           steps=eval_steps,
-          checkpoint_path=ckpt)
+          checkpoint_path=FLAGS.model_dir)
+          #checkpoint_path=ckpt)
       # print(resnet_classifier.get_variable_names())
       # for i in range(1,54):
       #   print(i)
@@ -695,15 +700,15 @@ def main(unused_argv):
       if current_step >= params.train_steps:
         tf.logging.info(
             'Evaluation finished after training step %d', current_step)
-        break
+        # break
 
-      except tf.errors.NotFoundError:
-        # Since the coordinator is on a different job than the TPU worker,
-        # sometimes the TPU worker does not finish initializing until long after
-        # the CPU job tells it to start evaluating. In this case, the checkpoint
-        # file could have been deleted already.
-        tf.logging.info(
-            'Checkpoint %s no longer exists, skipping checkpoint', ckpt)
+    except tf.errors.NotFoundError:
+      # Since the coordinator is on a different job than the TPU worker,
+      # sometimes the TPU worker does not finish initializing until long after
+      # the CPU job tells it to start evaluating. In this case, the checkpoint
+      # file could have been deleted already.
+      tf.logging.info(
+          'Checkpoint %s no longer exists, skipping checkpoint', ckpt)
 
   else:   # FLAGS.mode == 'train' or FLAGS.mode == 'train_and_eval'
     current_step = estimator._load_global_step_from_checkpoint_dir(FLAGS.model_dir)  # pylint: disable=protected-access,line-too-long

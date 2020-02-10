@@ -24,7 +24,7 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
+import numpy as np
 from tensorflow.contrib.model_pruning.python.layers import layers as prunelayers
 from tensorflow.contrib.model_pruning.python import pruning
 
@@ -315,10 +315,13 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=1, strides=1,
       data_format=data_format)
-  
-  # print("input.shape.1",inputs.get_shape())
 
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  # sparsity = 1-(tf.size(tf.count_nonzero(inputs))/tf.size(inputs))
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
+
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -326,10 +329,12 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  
-  # print("input.shape.2",inputs.get_shape())
 
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
+
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -338,10 +343,12 @@ def bottleneck_block(inputs, filters, is_training, strides,
       inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
       data_format=data_format)
 
-  # print("input.shape.3",inputs.get_shape())
+  sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+  print_out = tf.Print(sparsity, [sparsity])
 
-  inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
-                           data_format=data_format)
+  with tf.control_dependencies([print_out]):
+    inputs = batch_norm_relu(inputs, is_training, relu=False, init_zero=True,
+                            data_format=data_format)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -430,7 +437,12 @@ def resnet_v1_generator(block_fn, layers, num_classes,
         inputs=inputs, filters=64, kernel_size=7, strides=2,
         data_format=data_format)
     inputs = tf.identity(inputs, 'initial_conv')
-    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+    # measure sparsity for first conv layer
+    sparsity = 1-(tf.count_nonzero(inputs)/tf.size(inputs,out_type=tf.int64))
+    print_out = tf.Print(sparsity, [sparsity])
+
+    with tf.control_dependencies([print_out]):
+      inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
 
     inputs = tf.layers.max_pooling2d(
         inputs=inputs, pool_size=3, strides=2, padding='SAME',
